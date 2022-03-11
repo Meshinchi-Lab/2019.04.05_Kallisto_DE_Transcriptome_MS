@@ -1,0 +1,851 @@
+---
+title: 'Differential Expression of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 5, 2019"
+output: html_document
+---
+
+
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.04.05_Kallisto_DE_Transcriptome_MS/"))
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(DeGSEA, lib.loc = "/home/jlsmith3/R/x86_64-pc-linux-gnu-library/3.5") #my custom build R package that used to be imported through `source()` 
+library(ggalluvial)
+library(readr)
+getwd()
+```
+```{r}
+source(file.path(SCRIPTS,"conversion_scripts/GTF_to_IDmap_Function.r"))
+```
+
+
+
+#Define Functions 
+
+```{r}
+rmDups <- function(count.matrix, ID.map, matrix.class=TRUE){
+  #function to collapse duplicate genes using and ID map. Genes with identical symbols are selected by variance,
+  #df is the gene expression matrix. genes as rownames, patients as columns 
+  #IDmap is a data fram with gene_id for ensembl or other identifier and gene_name column for gene symbol. 
+  
+  df <- count.matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    left_join(., ID.map, by=c("gene_id")) %>% 
+    select(gene_id, gene_name, everything()) %>%
+    filter(!grepl("_PAR_", gene_id)) #specific to gencode refs
+  
+  
+  dup <- df$gene_name[which(duplicated(df$gene_name))]
+  ddf <- df %>%
+    filter(gene_name %in% dup) %>% 
+    arrange(gene_name)%>% 
+    mutate(Variance=genefilter::rowVars(select(., -gene_id, -gene_name))) %>%
+
+    group_by(gene_name) %>% 
+    mutate(High.Variance=Variance==max(Variance)) %>% 
+    ungroup() %>% 
+    
+    filter(High.Variance)  %>%
+    filter(!duplicated(gene_name)) %>% #if variance tied, pick first one
+    select(-gene_id, -Variance,-High.Variance, everything()) 
+  
+  rmDups.df <- df %>% 
+    filter(! gene_name %in% dup) %>% 
+    select(-gene_id) %>%
+    bind_rows(.,ddf) %>%
+    column_to_rownames("gene_name")
+  
+  if(matrix.class){
+    rmDups.df <- data.matrix(rmDups.df)
+  }
+  
+  return(rmDups.df)
+}  
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv("~/reference_mapping-files/00_Old/TARGET_AML_0531_1031_merged_CDEs_3.01.19.csv")
+
+
+merged <- merged %>% 
+  filter(!is.na(USI)) %>% 
+  set_rownames(.$USI)
+
+# head(merged[,1:5])
+dim(merged)
+```
+
+```{r}
+manifest <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/SequencingDataMatrix/TARGET_AML_RBD_0531_1031_miRNAseq_mRNAseq_Manifest_v5.csv")
+
+# head(manifest)
+```
+
+```{r}
+primary.fusion <- read.csv("~/RNA_seq_Analysis/2019.04.22_Transcriptome_Profile_AML/Final_list_AAML1031_fusions_with_cyto_information.csv")
+
+# head(primary.fusion)
+dim(primary.fusion)
+```
+
+```{r}
+table(primary.fusion$Primary.Fusion.CNV) %>% 
+  as.data.frame() %>% 
+  arrange(desc(Freq)) %>% 
+  head()
+```
+
+```{r}
+all_fusions <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/level2/fusion/concat_matrices/2017July_BCCA_0531_1031_TransAbyss_STAR_K.Mungall_Combined_Illumina_data/TARGET_AML_0531_1031_TransAbyss_STAR_TargetedAlignment_Condensed_Fusion_Columns_4.15.19.csv") %>% 
+  mutate(USI=str_split_fixed(Patient, "\\.", n=5)[,3])
+
+# head(all_fusions)
+```
+
+#Read in the Gene Annotation References
+
+https://bioconductor.org/packages/release/bioc/vignettes/tximport/inst/doc/tximport.html#limma-voom
+
+```{r eval=FALSE}
+anno <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno.csv") 
+
+# head(anno)
+dim(anno)
+```
+
+```{r}
+lncRNA <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+head(lncRNA)
+```
+
+```{r}
+lncRNA.tx <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_Transcript.IDmap.csv") %>% 
+  mutate_at(vars(gene_id:transcript_id),~gsub("\\.[0-9]{1,2}", "" , .))
+
+# head(lncRNA.tx)
+```
+
+
+## FANTOM CAT Pathways
+
+```{r eval=FALSE}
+cell.ont <- read.delim("Resources_References/nature21374-s2/supp_table_10.sample_ontology_information.tsv", 
+                       header=T)
+
+disease.ont <- read.delim("Resources_References/nature21374-s2/supp_table_12.trait_information.tsv",
+                          header=T)
+
+head(cell.ont)
+dim(cell.ont) #347   9
+
+head(disease.ont)
+dim(disease.ont) #817  11
+```
+
+```{r}
+# gs.cell <- str_split(cell.ont$associated_geneID, ",") %>% 
+#   lapply(., function(x) gsub("\\.[0-9]{1,2}$", "", x)) %>% 
+#   lapply(.,function(x) x[-grep("^CATG",x)]) %>%
+#   set_names(., gsub(" ", "_",cell.ont$sample_ontology_term))
+# 
+# # head(gs.cell)
+# # tail(gs)
+# length(gs.cell) #347
+# saveRDS(gs.cell, file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Cell_Ontologies.RDS"))
+
+gs.cell <- readRDS(file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Cell_Ontologies.RDS"))
+```
+
+```{r}
+# gs.dis <- str_split(disease.ont$associated_geneID, ",") %>% 
+#   lapply(., function(x) gsub("\\.[0-9]{1,}$", "", x)) %>% 
+#   lapply(.,function(x) x[-grep("^CATG",x)]) %>% 
+#   set_names(., gsub(" ", "_",disease.ont$trait_term))
+# 
+# length(gs.dis)
+# saveRDS(gs.dis, "~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Disease_Ontologies.RDS")
+
+gs.dis <- readRDS(file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Disease_Ontologies.RDS"))
+```
+
+```{r}
+# CAT <- readRDS("~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Disease_Cell_Ontologies.RDS")
+# length(CAT)
+```
+
+##NonCode Pathways
+
+```{r}
+nonCode.GO <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/NONCODEv5_human.func"), sep="\t", header=FALSE) %>% 
+  arrange(V1)
+
+head(nonCode.GO)
+# dim(nonCode.GO) # 1961    2
+# length(unique(nonCode.GO$V1)) #1961
+```
+
+```{r}
+GO.cats <- nonCode.GO %>% 
+  separate(V2,into=paste0("GO",1:25),sep=",", remove = TRUE,extra = "merge",fill="right") %>% 
+  select_if(~ ! all(is.na(.))) %>% 
+  
+  gather(Column,GO.Category,GO1:GO10) %>% 
+  dplyr::select(noncode_gene=V1,GO.Category) %>% 
+  mutate(noncode_gene=gsub("\\.[0-9]{1,2}$","", noncode_gene)) %>%
+  arrange(GO.Category) %>% 
+  
+  group_by(GO.Category) %>% 
+  mutate(genes=collapseRows(noncode_gene, uniq = T,sep=",")) %>%
+  ungroup()
+  
+# head(GO.cats)
+dim(GO.cats)
+# length(unique(GO.cats$GO.Category)) #1416
+```
+
+```{r}
+temp <- dplyr::select(GO.cats, GO.Category, genes) %>% unique()
+
+gs.nonCode <- str_split(temp$genes, "; ") 
+names(gs.nonCode) <- temp$GO.Category 
+
+idx <- sapply(gs.nonCode, length) >= 10
+gs.nonCode <- gs.nonCode[idx]
+
+head(gs.nonCode)
+# length(gs.nonCode) #277
+# saveRDS(gs.nonCode, file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/nonCode_v5_GO.Ontologies.RDS"))
+```
+
+
+##lnciPedia
+
+```{r eval=FALSE}
+GTF <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/lncipedia_5_2_hg38.gtf"), header = FALSE,sep="\t", comment.char = "#", skip = 2) 
+
+head(GTF)
+# dim(GTF) #357620      9
+```
+
+```{r eval=FALSE}
+lncipedia <-  GTF %>%
+    dplyr::pull(V9) %>% #use pull() to create vector from a single column 
+    unique() %>%
+    str_split(., pattern = "; ") %>%
+    lapply(., function(x) t(str_split(x, pattern = " ", simplify = TRUE))) %>%
+    sapply(.,  function(x) set_colnames(x, value = x[1,])[-1,]) %>%
+    sapply(., function(x) data.frame(x)) %>%
+    sapply(., function(x) filter_all(x,all_vars(!grepl(";|^$",.)))) %>%
+    bind_rows(.) %>%
+    dplyr::select(lncipedia_gene_id=gene_id,lncipedia_transcript_id=transcript_id,
+           everything()) %>% 
+    unite("tx_aliases",contains("transcript_alias"), sep="_", remove = FALSE) %>% 
+    unite("gene_aliases",contains("gene_alias"), sep="_", remove=FALSE) %>% 
+    mutate(noncode_transcript_alias=ifelse(grepl("NONHSAT",tx_aliases),
+                              gsub(".{0,}(NONHSAT[0-9]+)_.+","\\1", tx_aliases), 
+                              ""), 
+         ensembl_transcript_alias=ifelse(grepl("ENST",tx_aliases),
+                              gsub(".{0,}(ENST[0-9]+)_.+","\\1", tx_aliases), 
+                              ""),
+         ensembl_gene_alias=ifelse(grepl("ENSG",gene_aliases),
+                              gsub(".{0,}(ENSG[0-9]+)_.+","\\1", gene_aliases), 
+                              "")) %>% 
+    dplyr::select(lncipedia_gene_id,lncipedia_transcript_id,noncode_transcript_alias,
+         ensembl_transcript_alias, ensembl_gene_alias,
+         gene_alias_1:gene_alias_5,transcript_alias_1:transcript_alias_6)
+
+
+# lncipedia
+head(lncipedia) 
+dim(lncipedia)#127802     27
+
+# write.csv(lncipedia,"Resources_References/lncipedia_ID.mappings.csv", row.names = FALSE)
+```
+
+```{r}
+lncipedia <- read.csv("Resources_References/lncipedia_ID.mappings.csv")
+```
+
+
+
+#lncRNA Genomic Locations annotations
+
+## Map Novel CAT lncRNAs to gene IDs
+
+```{r message=FALSE}
+library(plyranges)
+library(GenomicFeatures)
+library(rtracklayer)
+```
+
+```{r}
+lncRNAs.db <- makeTxDbFromGFF(file = "/fh/fast/meshinchi_s/workingDir/TARGET/Reference_Data/GRCh38/gtf/gencode.v29.long_noncoding_RNAs.gtf")
+
+lncRNAs.db
+```
+
+```{r}
+lncRNAs.37 <- read.delim("/fh/scratch/delete90/meshinchi_s/jlsmith3/lncipedia_5_2_hg19.gff", sep="\t", comment.char = "#", header = FALSE) %>% 
+  filter(V3 != "exon")
+```
+
+```{r}
+genes.lnc <- genes(lncRNAs.db)
+genes.lnc$gene_id2 <- gsub("\\.[0-9]{1,2}", "", genes.lnc$gene_id)
+names(genes.lnc) <-  genes.lnc$gene_id2
+
+genes.37.lnc <- genes(lncRNAs.db)
+genes.37.lnc$gene_id2 <- gsub("\\.[0-9]{1,2}", "", genes.37.lnc$gene_id)
+names(genes.37.lnc) <- genes.37.lnc$gene_id2
+
+head(genes.37.lnc)
+```
+
+```{r}
+CAT.db <- read.delim("/fh/scratch/delete90/meshinchi_s/jlsmith3/5BFANTOMCAT5DRobustgene.gff", header = FALSE) %>% 
+  separate(V9, into=c("location", "class", "class2", "gene_id","Ref"), remove = T, sep="[\\|;]") %>% 
+  mutate(gene_id2=gsub("\\.[0-9]{1,2}", "", gene_id)) %>% 
+  filter(class2 != "coding_mRNA", grepl("CATG" ,gene_id))
+
+CAT.gr <- GRanges(seqnames = CAT.db$V1,
+                  ranges = IRanges(start=CAT.db$V4,end=CAT.db$V5), 
+                  strand = CAT.db$V7, 
+                  mcols=dplyr::select(CAT.db,gene_id, gene_id2, class,class2))
+names(CAT.gr) <- CAT.db$gene_id2
+
+CAT.gr
+```
+
+```{r}
+mapped.CAT <- subsetByOverlaps(x = genes.37.lnc, ranges = CAT.gr, minoverlap=50L, type='equal')
+
+mapped.CAT
+```
+
+```{r}
+eRNAs_intersect <- join_overlap_intersect(x=genes.lnc, y=enhancers)
+mcols(eRNAs_intersect)$width <- width(eRNAs_intersect)
+```
+
+```{r}
+hist(mcols(eRNAs_intersect)$width, breaks = seq (0,3000, by = 50))
+median(mcols(eRNAs_intersect)$width)
+```
+
+https://support.bioconductor.org/p/72656/
+
+```{r}
+hits <- findOverlaps(refGR, testGR)
+overlaps <- pintersect(refGR[queryHits(hits)], testGR[subjectHits(hits)])
+percentOverlap <- width(overlaps) / width(testGR[subjectHits(hits)])
+
+quantile(percentOverlap*100)
+```
+
+```{r}
+hits <- hits[percentOverlap > 0.28] 
+```
+
+
+#Investigate Suvival Associated lncRNAs
+
+```{r message=FALSE}
+library(goseq)
+library(GenomicFeatures)
+```
+
+```{r}
+lncRNA.universe <- read.csv("Survival/lncRNAs_Used_InModeling.csv") %>% #expressed lncRNAs
+  filter(., !grepl("PAR_", x))
+
+# gene.universe <- read_csv("Survival/TARGET_AML_RBD_TMMCPM_forModeling.csv")[[1]] #All Expressed Genes 
+# gene.universe <- grep("^ENSG",gene.universe, value=TRUE) %>% 
+#   grep("_PAR_Y",., invert = T, value=TRUE)
+# length(gene.universe) # 25643
+
+lncRNA.signature  <- read.csv("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_Coef_7.17.19.csv") %>% 
+  dplyr::select(gene_id=gene, everything())
+
+head(lncRNA.signature)
+```
+
+```{r}
+lncRNA.sig.tx <- lncRNA.tx %>% 
+  inner_join(., dplyr::select(lncRNA.signature,
+                       -c(gene_type:gene_name),
+                       -c(coef:P.Value)),
+             by="gene_id") %>% 
+  dplyr::select(-matches("^tag|^ont"))
+
+head(lncRNA.sig.tx)
+length(unique(lncRNA.sig.tx$gene_id))
+```
+
+```{r}
+lncRNAs.db <- makeTxDbFromGFF(file = file.path(GENREFS,"GRCh38/gtf/gencode.v29.long_noncoding_RNAs.gtf"))
+# lncRNAs.db
+
+tx_by_lnc <- transcriptsBy(lncRNAs.db, by="gene")
+names(tx_by_lnc) <-  gsub("\\.[0-9]{1,2}", "", names(tx_by_lnc))
+gene.lens <- median(width(tx_by_lnc))
+
+length(gene.lens)
+head(gene.lens)
+# quantile(gene.lens)
+```
+
+```{r}
+get_lncRNAs2 <- function(pathways,ID.map,DEGs=NULL){
+  
+ 
+ lncs <-  lapply(names(pathways),
+                 function(x) filter(ID.map,  gene_id %in% pathways[[x]]) %>% 
+                              mutate(Pathway=x)) %>%
+  bind_rows()
+ 
+ if(!is.null(DEGs)){
+  lncs <-  lncs %>% 
+    left_join(., rownames_to_column(DEGs, "gene_id") %>% 
+              select(logFC, adj.P.Val,gene_id),
+            by="gene_id")
+ }
+  
+  return(lncs)
+  
+}
+```
+
+
+## with FANTOM CAT Annotations
+
+```{r}
+gs.cell <- readRDS(file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Cell_Ontologies.RDS"))
+gs.dis <- readRDS(file.path(HOME,"0000.00.01_GSEA_geneSets_gmt/FANTOM_CAT_v1_Disease_Ontologies.RDS"))
+```
+
+```{r}
+lnc.Ontologies <- get_lncRNAs2(pathways = c(gs.cell, gs.dis),
+                               ID.map = lncRNA.signature) %>% 
+  group_by(Pathway) %>%
+  mutate(Number.In.Pathway=dplyr::n()) %>%
+  ungroup() %>%
+  arrange(desc(Number.In.Pathway))
+
+
+dim(lnc.Ontologies) #308   8
+head(lnc.Ontologies)
+# write.csv(lnc.Ontologies, "Survival/TARGET_AML_RBD_lncRNAs_Coef_Pathways_7.25.19.csv")
+```
+
+```{r}
+lncSig <- ifelse(names(gene.lens) %in% lncRNA.signature$gene_id, 1,0) %>%
+  set_names(names(gene.lens))
+
+head(lncSig)
+table(lncSig)
+```
+
+```{r}
+CAT.cell <-  lapply(names(gs.cell), function(x) data.frame(gene_id=gs.cell[[x]],
+                                                     Pathways=rep(x, length(gs.cell[[x]])))) %>% 
+  bind_rows() %>% 
+  filter(! grepl("^CATG", gene_id)) 
+
+# head(CAT.cell)
+# dim(CAT.cell)
+length(unique(CAT.cell$Pathways)) #347
+
+
+
+CAT.dis <-  lapply(names(gs.dis), function(x) data.frame(gene_id=gs.dis[[x]],
+                                                     Pathways=rep(x, length(gs.dis[[x]])))) %>% 
+  bind_rows() %>% 
+  filter(! grepl("^CATG", gene_id)) #%>%
+
+# head(CAT.dis)
+# dim(CAT.dis)
+length(unique(CAT.dis$Pathways)) #347
+```
+
+```{r}
+pwf <- nullp(DEgenes = lncSig, 
+              genome = "hg19", 
+              id = "ensGene", 
+              bias.data = gene.lens,
+              plot=FALSE)
+
+GO.cell <- goseq(pwf, 
+                 genome = "hg19",
+                 id="ensGene", 
+             gene2cat = CAT.cell, 
+             use_genes_without_cat=TRUE)
+
+GO.cell.filt <-  GO.cell %>% 
+  filter(numInCat < 500 & numInCat >= 20) %>%
+  arrange(over_represented_pvalue) %>%
+  mutate(FDR_Over=p.adjust(over_represented_pvalue, method = "BH"),
+         FDR_Under=p.adjust(under_represented_pvalue, method = "BH")) %>%
+  filter(FDR_Over < 0.25 | FDR_Under < 0.25)
+
+
+head(GO.cell.filt,n=20)
+# tail(GO.cell.filt)
+dim(GO.cell.filt) #13
+
+# write.csv(GO.cell.filt, "TARGET_AML_SurvivalAssociatedLncRNAs_FANTOM_CAT_CellOnt.csv", row.names = FALSE)
+```
+
+```{r}
+GO.cell %>% 
+  filter(grepl("hema", category))
+```
+
+```{r}
+GO.dis <- goseq(pwf, 
+                 genome = "hg19",
+                 id="ensGene", 
+             gene2cat = CAT.dis, 
+             use_genes_without_cat=TRUE)
+
+GO.dis.filt <-  GO.dis %>% 
+  filter(numInCat < 500 & numInCat >= 20) %>%
+  arrange(over_represented_pvalue) %>%
+  mutate(FDR_Over=p.adjust(over_represented_pvalue, method = "BH"),
+         FDR_Under=p.adjust(under_represented_pvalue, method = "BH")) #%>%
+  # filter(FDR_Over < 0.25 | FDR_Under < 0.25)
+
+
+head(GO.dis.filt,n=20)
+# tail(GO.cell.filt)
+dim(GO.dis.filt) #13
+```
+
+
+```{r}
+dat <- filter(lnc.Ontologies, Number.In.Pathway >= 3) %>% 
+  filter(Pathway %in% GO.cell.filt$category)
+
+  
+pathway.bar <- ggplot( dat, aes(x=reorder(Pathway,Number.In.Pathway),y=Number.In.Pathway, fill=Pathway)) + 
+  geom_bar(stat="identity", position = 'dodge') + 
+  theme_classic() + 
+  scale_fill_brewer(palette = "Set1") +
+  labs(x="",y="Number of lncRNAs\nin Pathway", title="Survival Associated lncRNAs\n Ontology Enrichement") +
+  theme(legend.position = 'none', 
+        plot.title = element_text(size=14),
+        axis.title = element_text(size=14),
+        axis.text.y = element_text(size=20),
+        axis.text.x = element_text(vjust=1, hjust = 1, size=14, angle = 20),
+        plot.margin = margin(l=2,unit="cm"))
+
+
+# ggsave(pathway.bar,"TARGET_AML_SurvivalAssociatedLncRNAs_Pathways_FANTOM_CAT.png", device="png", dpi=300,height=4, width = 6, units="in")
+# saveRDS(pathway.bar,"pathway.bar.RDS")
+```
+
+
+## with LncBook 
+
+https://bigd.big.ac.cn/lncbook/index
+
+```{r}
+gtf <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/LncBook_GENCODE_GRCh38.gtf"),
+                  sep="\t", comment.char = "#",
+                  header=FALSE)
+
+head(gtf)
+
+lncBook.IDs <- getIDmap(gtf)
+head(lncBook.IDs)
+```
+
+```{r}
+lncbook.dis <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/lncbook_disease_lncrna.txt"), header=FALSE) %>% 
+  select(lncBook_transcript=V1,lncBook_gene_id=V2,gene=V3,alias=V4,Disease=V5, PMID=V8, everything())
+
+head(lncbook.dis)
+dim(lncbook.dis) #3772   13
+```
+
+```{r}
+lncbook.func <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/lncbook_function_lncrna.txt"), header=FALSE) %>% 
+  select(lncBook_transcript=V1,lncBook_gene_id=V2,
+         gene=V3,alias=V4,Function=V5,Process=V6, PMID=V8)
+
+head(lncbook.func)
+dim(lncbook.func) #3762   11
+```
+
+```{r}
+lncBook.IDs.clean <- lncBook.IDs %>% 
+  select(gene_id:transcript_name, contains("alias"))
+
+head(lncBook.IDs.clean)
+lapply(select(lncBook.IDs.clean, contains("alias")), function(x) table(grepl("^ENST", x)))
+
+write.csv(lncBook.IDs.clean, "lncBook.ID.map.csv", row.names = FALSE)
+```
+
+```{r}
+lncBook.Sig <- lncBook.IDs.clean %>% 
+  mutate_at(vars(transcript_alias_1:transcript_alias_8),
+            ~gsub("\\.[0-9]{1,2}_[0-9]", "",.)) %>% #remove version numbers
+  
+  #check that any of the alias columns have the appropriate 
+  filter_at(vars(transcript_alias_1:transcript_alias_8), any_vars(. %in% lncRNA.sig.tx$transcript_id)) %>% 
+  select(lncBook_gene_id=gene_id, lncBook_transcript=transcript_id,lncBook_gene_type=gene_type,everything(),
+         -gene_name,-transcript_type,-transcript_name) %>%
+  
+  #Add GENCODE annotations
+  inner_join(.,lncRNA.sig.tx,
+             by=c("transcript_alias_1"="transcript_id")) %>%
+  select_if(~ ! all(is.na(.)))
+  
+# lncBook.Sig
+dim(lncBook.Sig) #19
+length(unique(lncBook.Sig$lncBook_ID)) #18/37 lncRNA genes have lncBook IDs
+```
+
+```{r}
+sum(lncBook.Sig$lncBook_transcript %in% lncbook.dis$lncBook_transcript) #0
+```
+
+```{r}
+sum(lncBook.Sig$lncBook_transcript %in% lncbook.func$lncBook_transcript) #0
+```
+
+
+## with lncDisease v2.0
+
+http://www.rnanut.net/lncrnadisease/download.html
+
+```{r}
+lncDis2.0 <- read.csv("lncDisease2.0/experimental lncRNA-disease information_lncRNADiseasev2.0.csv") %>% 
+  filter(Species == "Homo sapiens")
+
+# head(lncDis2.0)
+dim(lncDis2.0) #10002     9
+```
+
+```{r}
+lncDis.hits <- lncDis2.0 %>% 
+  filter(ncRNA.Symbol %in% lncRNA.signature$gene_name)
+
+
+lncDis.hits
+dim(lncDis.hits)
+unique(lncDis.hits$ncRNA.Symbol) #4
+# write.csv(lncDis.hits,"TARGET_AML_SurvivalAssociatedLncRNAs_lncRNADiseasev2.0_Hits.csv", row.names = FALSE)
+```
+
+
+## with miTranscriptome
+
+```{r}
+miTranscriptome.func <- read.csv("miTranscriptome/miTranscriptome_lncRNAs_withGeneNames.csv")
+
+head(miTranscriptome.func[,1:5])
+dim(miTranscriptome.func) #17599   243
+```
+
+```{r}
+sum(miTranscriptome.func$func_name_final %in% lncRNA.signature$gene_name) #0
+```
+
+
+##with NonCode
+
+```{r}
+nonCode.gene.IDmap <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/NONCODEv5_Transcript2Gene"),
+                                 sep="\t", header=FALSE) %>%
+  mutate_all(~gsub("\\.[0-9]{1,2}","",.))
+
+head(nonCode.gene.IDmap)
+```
+
+```{r eval=FALSE}
+GTF <- read.delim(file.path(SCRATCH,"jlsmith3/lncRNA/NONCODEv5_human_hg38_lncRNA.gtf"), 
+                  sep="\t", header=FALSE, stringsAsFactors = FALSE) %>% 
+  filter(! grepl("^\\.$", V7)) # A number of the lncRNAs have a "." for strand. Breaks the makeTxDBFromGFF() function. 
+head(GTF)
+dim(GTF)
+table(GTF$V7)
+# write_tsv(GTF, file.path(SCRATCH,"jlsmith3/lncRNA/NONCODEv5_human_hg38_stranded_lncRNA.gtf"),col_names = FALSE)
+```
+
+```{r}
+nonCode.db <- makeTxDbFromGFF(file.path(SCRATCH,"jlsmith3/lncRNA/NONCODEv5_human_hg38_stranded_lncRNA.gtf"))
+
+nc_by_lnc <- transcriptsBy(nonCode.db, by="gene")
+names(nc_by_lnc) <-  gsub("\\.[0-9]{1,2}", "", names(nc_by_lnc))
+nc.lens <- median(width(nc_by_lnc))
+
+length(nc.lens) #78793
+head(nc.lens)
+```
+
+```{r}
+nonCode.all <- lncipedia %>% 
+  mutate_at(vars(contains("alias")),
+            ~gsub("^(ENST.+)\\.[0-9]{1,2}$", "\\1",.)) %>% #remove version numbers
+  filter_at(vars(contains("alias")), 
+            any_vars(. %in% lncRNA.tx$transcript_id))  #%>% 
+
+nonCode.tx.universe <- nonCode.all %>% 
+  filter_all(any_vars(grepl("NONHSAT",.))) %>% 
+  unlist() %>% 
+  grep("NONHSAT", ., value=TRUE) %>% 
+  unique()
+
+length(nonCode.tx.universe) #17,190
+
+nonCode.universe <- nonCode.gene.IDmap %>% 
+  filter(V1 %in% nonCode.tx.universe) %>%
+  pull(V2) %>% 
+  unique()
+
+length(nonCode.universe) #11,197
+nonCode.universe[order(nonCode.universe)][1:20]
+```
+
+```{r}
+nonCode.sig <- lncipedia %>% 
+  mutate_at(vars(contains("alias")),
+            ~gsub("^(ENSG.+)\\.[0-9]{1,2}$", "\\1",.)) %>% #remove version numbers
+  mutate_at(vars(contains("alias")),
+            ~gsub("^(ENST.+)\\.[0-9]{1,2}$", "\\1",.)) %>% #remove version numbers
+  filter_at(vars(contains("alias")), 
+            any_vars(. %in% lncRNA.sig.tx$transcript_id))  %>% 
+  unite("tx_aliases",contains("transcript_alias"), sep="_", remove = FALSE) %>% 
+  unite("gene_aliases",contains("gene_alias"), sep="_", remove=FALSE) %>% 
+  mutate(noncode_transcript_alias=ifelse(grepl("NONHSAT",tx_aliases),
+                              gsub(".{0,}(NONHSAT[0-9]+)_.+","\\1", tx_aliases), 
+                              ""), 
+         ensembl_transcript_alias=ifelse(grepl("ENST",tx_aliases),
+                              gsub(".{0,}(ENST[0-9]+)_.+","\\1", tx_aliases), 
+                              ""),
+         ensembl_gene_alias=ifelse(grepl("ENSG",gene_aliases),
+                              gsub(".{0,}(ENSG[0-9]+)_.+","\\1", gene_aliases), 
+                              "")) %>% 
+  dplyr::select(lncipedia_gene_id,lncipedia_transcript_id,noncode_transcript_alias,
+         ensembl_transcript_alias, ensembl_gene_alias,
+         gene_alias_1:gene_alias_5,transcript_alias_1:transcript_alias_6)
+  
+head(nonCode.sig)
+# dim(nonCode.sig)
+```
+
+```{r}
+nonCode.sig.txs <- nonCode.sig %>% 
+  pull(noncode_transcript_alias) %>%
+  unlist() %>% 
+  grep("NONHSAT", ., value=TRUE)
+length(nonCode.sig.txs) #39
+
+nonCode.sig.gns <- nonCode.gene.IDmap %>% 
+  filter(V1 %in% nonCode.sig.txs) %>%
+  pull(V2) %>% 
+  unique()
+
+length(nonCode.sig.gns) #26
+```
+
+```{r}
+table(names(nc.lens) %in% nonCode.sig.gns)
+setdiff(nonCode.sig.gns,names(nc.lens))  #these seem to have no information on NONCODE db, though there are entries with all NA values. Also not in the unfiltered GTF. Just not in V5 is appears
+table(nonCode.universe %in% nonCode.sig.gns)
+```
+
+```{r}
+nc.ontologies <-  lapply(names(gs.nonCode),
+                 function(x) filter(nonCode.sig,  noncode_transcript_alias %in% gs.nonCode[[x]]) %>% 
+                              mutate(Pathway=x)) #%>%
+  # bind_rows()
+nc.ontologies #zero
+```
+
+
+# Enhancer RNA ?
+
+```{r message=FALSE}
+library(plyranges)
+library(GenomicFeatures)
+library(rtracklayer)
+```
+
+```{r}
+lncRNAs.db <- makeTxDbFromGFF(file = file.path(GENREFS,"/GRCh38/gtf/gencode.v29.long_noncoding_RNAs.gtf"))
+
+lncRNAs.db
+```
+
+```{r}
+enhancers <- import("/fh/scratch/delete90/meshinchi_s/jlsmith3/lncRNA/F5.hg38.enhancers.bed")
+
+enhancers
+```
+
+```{r}
+genes.lnc <- genes(lncRNAs.db)
+strand(genes.lnc) <- "*"
+```
+
+```{r}
+eRNAs.all <- subsetByOverlaps(x = genes.lnc, ranges = enhancers, minoverlap=200L, type='any')
+```
+
+https://support.bioconductor.org/p/72656/
+
+```{r}
+hits <- findOverlaps(refGR, testGR)
+overlaps <- pintersect(refGR[queryHits(hits)], testGR[subjectHits(hits)])
+percentOverlap <- width(overlaps) / width(testGR[subjectHits(hits)])
+
+quantile(percentOverlap*100)
+```
+
+
+```{r}
+hits <- hits[percentOverlap > 0.28] #of 6,858 enhancer regions in w some overlaping lncRNA transcription, only 50% have > 28% of basepairs overlapping. so most have just under 1/3 covered by enahncer region
+```
+
+```{r}
+eRNAs_intersect <- join_overlap_intersect(x=genes.lnc, y=enhancers)
+mcols(eRNAs_intersect)$width <- width(eRNAs_intersect)
+```
+
+```{r}
+hist(mcols(eRNAs_intersect)$width, breaks = seq (0,3000, by = 50))
+median(mcols(eRNAs_intersect)$width)
+```
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

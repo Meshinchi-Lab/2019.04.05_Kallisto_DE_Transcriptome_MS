@@ -1,0 +1,47 @@
+---
+title: 'Surivival Analysis of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 16, 2019"
+output: html_document
+---
+
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE, fig.align='center', fig.height=5,
+                      fig.width=8, dpi = 600)
+
+options(stringsAsFactors = FALSE)
+options(expressions = 500000)
+
+options(stringsAsFactors = FALSE,bitmapType = 'cairo')
+# grDevices::X11.options(type='cairo')
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+library(DeGSEA) #my custom build R package that used to be imported through `source` 
+library(pheatmap)
+library(RColorBrewer)
+library(edgeR)
+library(survival)
+library(gtools)
+library(gridExtra)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS, "survival_analysis/Survplot_Functions_2018.10.24.r"))
+```

@@ -1,0 +1,719 @@
+---
+title: 'Surivival Analysis of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 16, 2019"
+output: html_document
+---
+
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+
+options(stringsAsFactors = FALSE)
+options(expressions = 500000)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+library(DeGSEA) #my custom build R package that used to be imported through `source` 
+library(pheatmap)
+library(RColorBrewer)
+library(edgeR)
+library(survival)
+library(gtools)
+library(gridExtra)
+getwd()
+```
+
+```{r}
+# source("~/scripts/survival_analysis/Survplot_Functions_2018.10.24.r")
+```
+
+
+#Define Functions
+
+```{r}
+rmDups <- function(count.matrix, ID.map, matrix.class=TRUE,rowname.GeneSym=TRUE){
+  
+  df <- count.matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    left_join(., ID.map, by=c("gene_id")) %>% 
+    select(gene_id, gene_name, everything()) %>%
+    filter(!grepl("_PAR_", gene_id)) #specific to gencode refs
+  
+  
+  dup <- df$gene_name[which(duplicated(df$gene_name))]
+  ddf <- df %>%
+    filter(gene_name %in% dup) %>% 
+    arrange(gene_name)%>% 
+    mutate(Variance=genefilter::rowVars(select(., -gene_id, -gene_name))) %>%
+
+    group_by(gene_name) %>% 
+    mutate(High.Variance=Variance==max(Variance)) %>% 
+    ungroup() %>% 
+    
+    filter(High.Variance)  %>%
+    filter(!duplicated(gene_name))#if variance tied, pick first one
+    
+  
+  if(rowname.GeneSym){
+    rmDups.df <- df %>% 
+        filter(! gene_name %in% dup) %>% 
+        bind_rows(.,ddf) %>%
+        select(everything(),-gene_id, -Variance,-High.Variance) %>%
+        column_to_rownames("gene_name")
+  }else{
+    rmDups.df <- df %>% 
+        filter(! gene_name %in% dup) %>% 
+        bind_rows(.,ddf) %>%
+        select(everything(),-gene_name, -Variance,-High.Variance) %>%
+        mutate(gene_id=gsub("\\.[0-9]{1,2}", "", gene_id)) %>% 
+        column_to_rownames("gene_id")
+  }
+
+  if(matrix.class){
+    rmDups.df <- data.matrix(rmDups.df)
+  }
+  
+  return(rmDups.df)
+}  
+```
+
+```{r}
+plots <- function(df, Gene.Col,log=FALSE, type="wfall"){
+  
+  if(!log){df[,Gene.Col] <- 2^(df[,Gene.Col]-1)} #non-log2
+  
+  if(type=="wfall"){
+   p <- ggbarplot(df, 
+            x = "SWOG_ID", y = Gene.Col,
+          fill = "lnc.Percentile.Groups",              
+          color = "lnc.Percentile.Groups",           
+          palette = "jco",            
+          sort.val = "asc",           
+          sort.by.groups = FALSE,      
+          x.text.angle = 90,           
+          scales="free") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  if(type=="box"){
+   p <- ggboxplot(df, 
+          x = "lnc.Percentile.Groups", y = Gene.Col, 
+          fill = "lnc.Percentile.Groups",               
+          palette = "jco",            
+          sort.val = "asc",           
+          sort.by.groups = FALSE,      
+          x.text.angle = 90,           
+          scales="fixed") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  return(p)
+}
+```
+
+
+#Read in the Clinical Data
+
+Notes:
+From: Pogosova-Agadjanyan, Era <epogosov@fredhutch.org>
+Sent: Monday, March 30, 2020 1:31 PM
+To: Smith, Jenny L <jlsmith3@fredhutch.org>; Stirewalt, Derek L <dstirewa@fredhutch.org>
+Cc: Ries, Rhonda E <rries@fredhutch.org>
+Subject: Re: SWOG AML RNA-seq Questions
+ 
+Hi Jenny and Rhonda,
+
+Majority of missing patient IDs are for the CA190661 study.  I will have to get those from our statisticians as they are from a different project than CA160872 (majority of data). I was able to provide the patient ID for two of the samples.  We are just starting the analyses for the CA190661 study so I do not have any data on the patients that were unique to this study (all are in your list).
+
+I have added the comments regarding the duplicate samples.  During the sample prep, there was a tech error which resulted in RNA loss.  For some of these samples, we were able to provide another aliquot from a different experiment, however, some of these had sufficient RNA that could have been processed using standard methodology (_Lim) or with additional cycle numbers (_Lim15).  We are using non-limited replicates for our analyses.  At some point, we will want to look to see how the limited amount/additional samples impact our ability to detect expression changes.
+
+
+```{r}
+dir(SWOG,full.names = T)
+# dir(file.path(SWOG,"RNA","mRNAseq","metadata"), full.names = T)
+# dir(file.path(SWOG,'Clinical',"CDE","Merged"), full.names = T)
+```
+
+```{r}
+pts <- read.csv(file.path(SWOG,"RNA","mRNAseq","metadata","SWOG_AML_Kallisto_Quant_Gencode_v29_RepBase_v24.01_Sample_IDmap.csv"))
+
+
+head(pts[,2:4], n=20)
+dim(pts) #320 patients
+```
+
+```{r}
+ClinData <- read.csv(file.path(SWOG,'Clinical',"CDE","Merged","SWOG_AML_Merged_CDEs_2.20.20.csv"), na.strings = c("NA","N/A","#NA","#N/A","^$","^\\.$"))
+
+
+dim(ClinData)
+head(ClinData[,1:5])
+```
+
+```{r}
+# colnames(ClinData)
+table(is.na(ClinData$OS.days))
+table(is.na(ClinData$SWOGID)) #only about half have SWOG IDs..
+```
+
+## Merge the CDEs/Manifest
+
+
+```{r}
+merged <- pts %>%
+  mutate_at(vars(SWOGID), ~gsub("2008-04552","2005-04552",.)) %>%
+  left_join(., ClinData, by=c("SWOGID")) %>% 
+  mutate_at(vars(Group), ~case_when(
+    Sample_Type == "blasts" & Group =="AML" ~ "AML_blasts",
+    Sample_Type == "bulk mononuclear" & Group == "AML" ~ "AML_bulk",
+    TRUE ~ Group)) 
+  
+
+
+dim(merged)
+```
+
+```{r}
+table(pts$Group,pts$Sample_Type)
+table(merged$Group)
+
+table(is.na(merged$OS.days)) #181 samples have OS time. 
+```
+
+```{r}
+bulk.outcome <- filter(merged, !is.na(OS.days)) %>% 
+                select(filename,SWOGID,OS.days,OS.indicator,Group, Sample_Type) %>% 
+                filter(Sample_Type!="blasts")
+
+# table(bulk.outcome$Group, duplicated(bulk.outcome$SWOGID))
+# dim(bulk.outcome)
+
+bulk.outcome
+```
+
+
+```{r}
+blast.outcome <- filter(merged, !is.na(OS.days)) %>% 
+                select(filename,SWOGID,OS.days,OS.indicator,Group, Sample_Type) %>% 
+                filter(Sample_Type=="blasts")
+
+table(blast.outcome$Group, duplicated(blast.outcome$SWOGID))
+sum(blast.outcome$SWOGID %in% bulk.outcome$SWOGID) # 59 samples have bulk and blast purified RNA-seq
+```
+
+
+# Read in the counts
+
+```{r}
+# dir(file.path(SWOG,"RNA","mRNAseq","analysis","2020.01.16_Kallisto_Quant"))
+```
+
+```{r}
+RBD.swog <- readRDS(file.path(SWOG,"RNA","mRNAseq","analysis","2020.01.16_Kallisto_Quant",
+                              "SWOG_AML_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+rownames(RBD.swog) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD.swog))
+
+
+head(RBD.swog[,1:5])
+dim(RBD.swog) #59853  320
+```
+
+
+# Read in the Gene Annotations
+
+```{r}
+IDmap <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_12.23.19.csv"))
+
+# head(IDmap)
+dim(IDmap)
+```
+
+```{r}
+lncRNAs <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+# head(lncRNAs)
+dim(lncRNAs)
+```
+
+```{r}
+lncRNA.Sig <- read.csv("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_Coef_7.17.19.csv")
+
+head(lncRNA.Sig)
+```
+
+```{r}
+LSC17 <- read.csv(file.path(HOME,"2017.02.28_LSC17_Score/LSC17_Genes_Coeff_update.csv"),
+                  row.names = 1)
+head(LSC17)
+```
+
+Alias: 
+
+FAM30A == KIAA0125
+BEX3 == NGFRAP1
+ADGRG1== GPR56
+
+# TMM Normalize the Counts
+
+```{r}
+keep <- rowSums(cpm(RBD.swog) >= 1) >= 0.05*ncol(RBD.swog)
+low_expn <- setdiff(lncRNA.Sig$gene,names(keep[keep]))
+keep[lncRNA.Sig$gene] <- TRUE #Kinda forcing this one. There are 9 of the lncRNAs that DONT meet the expression threshold of at least 1 CPM in 5% of patients
+table(keep)
+```
+
+```{r}
+RBD.swog.subset <- RBD.swog[keep,] 
+TMM.norm <- calcNormFactors(RBD.swog.subset, method = 'TMM')
+lib.size <- colSums(RBD.swog.subset)
+
+CPM <- cpm(RBD.swog.subset, 
+          lib.size = lib.size*TMM.norm,
+          log=TRUE, 
+          prior.count = 0.5)
+
+dim(CPM) #24119   320
+```
+
+```{r}
+sum(lncRNA.Sig$gene %in% rownames(CPM)) #OK
+sum(LSC17$gene_id %in% rownames(CPM)) #OK
+```
+
+
+# Expression of Lncs vs mRNAs
+
+```{r}
+df <- CPM %>% 
+  as.data.frame() %>%
+  rownames_to_column("gene") %>% 
+  mutate(lncRNA=ifelse(gene %in% lncRNAs$gene_id, "yes","no")) %>% 
+  gather(sample,log2_CPM,-gene,-lncRNA) %>% 
+  left_join(., select(merged, filename,SWOGID,
+                      Sample_Type, Group), 
+            by=c("sample"="filename"))
+
+head(df)
+```
+
+```{r}
+df %>% 
+  group_by(lncRNA) %>%
+  summarize(max=max(log2_CPM), 
+            min=min(log2_CPM),
+            Q4=quantile(log2_CPM)[4])
+```
+
+```{r}
+swog.dens.plot <- ggplot(data = df, 
+                         aes(log2_CPM, fill=lncRNA)) +
+  geom_density() +
+  facet_wrap(~Group) +
+  theme_classic()
+  
+
+swog.dens.plot
+```
+
+
+#Calculate lncRNA Scores
+
+```{r}
+sum(colnames(CPM) %in% merged$filename) #OK
+```
+
+```{r}
+intersect(lncRNA.Sig$gene, LSC17$gene_id) #OK
+```
+
+```{r}
+SWOG_lncScores <- merged %>% 
+    #Add lncScores  across the whole dataset
+    inner_join(., CPM[lncRNA.Sig$gene,] %>% 
+                 t() %>% 
+                 as.data.frame() %>% 
+                 rownames_to_column("filename"), 
+               by=c("filename")) %>% 
+    mutate(lnc.Score=apply(dplyr::select(.,lncRNA.Sig$gene), 1,
+                               function(x) sum(x*lncRNA.Sig$coef))) %>%
+    # select(-c(lncRNA.Sig$gene)) %>% #thre are no overlapping
+    
+    #Add LSC17 Scores 
+    inner_join(., CPM[LSC17$gene_id,] %>% 
+                 t() %>% 
+                 as.data.frame() %>% 
+                 rownames_to_column("filename"), 
+               by=c("filename")) %>% 
+    mutate(LSC17.Score=apply(dplyr::select(.,LSC17$gene_id), 1,
+                               function(x) sum(x*LSC17$LSC17_Coeff))) %>% 
+    # select(-c(LSC17$gene_id)) %>%
+    
+    #Define Discretized groups
+    mutate(lnc.Pos.Neg=ifelse(lnc.Score > 0, "Pos", "Neg"),
+           lnc.Med.Groups=factor(ifelse(lnc.Score >= median(lnc.Score), "high", "low"),
+                                        levels=c("low", "high")),
+           lnc.Percentile.Groups=as.factor(quantcut(lnc.Score, q=4, na.rm=FALSE,
+                                                        labels=paste0("q",1:4))),
+           LSC.Med.Groups=factor(ifelse(LSC17.Score >= median(LSC17.Score), "high", "low"),
+                                        levels=c("low", "high")), 
+           LSC.Percentile.Groups=as.factor(quantcut(LSC17.Score, q=4, na.rm=FALSE,
+                                                        labels=paste0("q",1:4))),
+           LSC.q4vq123=ifelse(lnc.Percentile.Groups == "q4", "q4", "q123"))
+
+
+dim(SWOG_lncScores)
+# head(SWOG_lncScores[,2:10])
+# write.csv(SWOG_lncScores, "SWOG_AML_lncScores_CDE_03.27.20.csv", row.names = FALSE)
+```
+     
+```{r}
+table(SWOG_lncScores$lnc.Med.Groups)
+table(SWOG_lncScores$lnc.Pos.Neg)
+```
+
+```{r}
+quantile(SWOG_lncScores$LSC17.Score,probs = seq(0,1,length.out = 11))
+quantile(SWOG_lncScores$lnc.Score,probs = seq(0,1,length.out = 11))
+```
+
+
+#Compare lncRNA expression by bulk vs blast purfied 
+
+```{r}
+bplot.df <- SWOG_lncScores %>% 
+  select(SWOGID, filename,Group,Sample_Type, 
+         RNA_Expraction_Type, Tissue_Source, lncRNA.Sig$gene) %>% 
+  gather(Gene,log2_CPM, lncRNA.Sig$gene) %>% 
+  filter(Group != "AML", RNA_Expraction_Type != "microRNA preserved RNA")
+
+head(bplot.df)
+length(unique(bplot.df$Gene))
+table(bplot.df$Group)
+```
+
+```{r}
+bplot.df %>% 
+  group_by(Group,Gene) %>% 
+  summarise_at(vars(log2_CPM),
+               .funs = list(N=~n(),mean=~mean(.),median=~median(.),max=~max(.))) %>%
+  arrange(Gene) %>%
+  filter(grepl("AML",Group))
+```
+
+```{r fig.height=5}
+swog.box.plot <- ggplot(data = bplot.df, 
+                         aes(y=log2_CPM, x=Group,fill=Group)) +
+  geom_boxplot()+
+  # facet_wrap(~Group) +
+  theme_classic()
+  
+
+swog.box.plot
+```
+
+#Data for SWOG statistician
+
+### All samples de-duped
+
+```{r}
+SWOG_lncScores <- read.csv("SWOG_AML/SWOG_AML_lncScores_CDE_03.27.20.csv")
+
+dim(SWOG_lncScores)
+length(unique(SWOG_lncScores$SWOGID))
+```
+
+```{r}
+SWOG_rmDups <- SWOG_lncScores %>% 
+  filter(grepl("AML_",Group)) %>%
+  filter(!grepl("Lim",filename)) %>%
+  #remove dups due to different RNA extraction protocols and this dup with "Lim" code that I am not familiar with
+  group_by(SWOGID) %>% 
+  mutate(N=n()) %>% 
+  mutate(Keep=case_when(
+    N==1 ~ TRUE,
+    N==2 & sum(Fraction == "VLB")==2 & RNA.type=="miRNA" ~ TRUE,
+    N==2 & sum(Fraction == "VLB")==1 & Fraction == "VLB" ~ TRUE)) %>%
+  ungroup() %>%
+  # filter(RNA.type != "miRNA") %>%
+  filter(Keep) %>% 
+  arrange(lnc.Pos.Neg,Patient.ID)
+
+
+dim(SWOG_rmDups)
+# View(select(SWOG_rmDups, SWOGID,Patient.ID,lnc.Pos.Neg))
+```
+
+```{r}
+table(SWOG_rmDups$lnc.Pos.Neg)
+```
+
+```{r}
+# table(SWOG_rmDups$N, useNA = 'ifany')
+# table(SWOG_rmDups$Keep, useNA = 'ifany')
+table(SWOG_rmDups$Group,SWOG_rmDups$RNA_Expraction_Type)
+table(duplicated(SWOG_rmDups$SWOGID))
+SWOG_rmDups$filename[duplicated(SWOG_rmDups$SWOGID)]
+# table(!is.na(SWOG_rmDups$OS.days))
+sum(is.na(SWOG_rmDups$Patient.ID))
+# setdiff(unique(SWOG_lncScores$SWOGID), SWOG_rmDups$SWOGID)
+```
+
+```{r}
+# write.csv(select(SWOG_rmDups,SWOGID,Patient.ID,
+#                  Positive_vs_Negative=lnc.Pos.Neg),
+#           "SWOG_AML_lncScore_Groups_forKMAnalysis_04.01.20.csv",
+#           row.names = FALSE)
+
+```
+
+
+
+### Bulk Samples
+
+```{r}
+bulk_only <- SWOG_lncScores %>% 
+  filter(Group=="AML_bulk") %>%
+  # mutate(Positive_vs_Negative=ifelse(Positive_vs_Negative == "Pos", "A", "B")) %>%
+  arrange(desc(lnc.Pos.Neg))
+
+dim(bulk_only) #96
+# sum(duplicated(bulk_only$SWOGID)) #OK
+# sum(duplicated(bulk_only$Patient.ID))  #OK
+any(is.na(bulk_only$Patient.ID))
+
+#These were originally sent to Megan Othus
+# write.csv(select(bulk_only,SWOGID,Patient.ID,Positive_vs_Negative=lnc.Pos.Neg),
+#           "SWOG_AML_lncScore_Groups_forKMAnalysis_03.27.20.csv",
+#           row.names = FALSE)
+```
+
+```{r}
+#Fill out this file to denote which samples were used for 
+stirewalt_sra_submission <- openxlsx::loadWorkbook("Stirewalt_SRA_Submission/Master DATA Name File Meshinchi Manuscripts.xlsx")
+```
+
+```{r}
+# names(stirewalt_sra_submission)
+sheet8 <- openxlsx::readWorkbook(stirewalt_sra_submission, sheet = "Sheet8", 
+                                 colNames=TRUE, 
+                                 check.names=FALSE, 
+                                 sep.names=" ") %>% 
+  rename_all(~gsub("\\.", " ", .)) %>% 
+  mutate(filename=gsub("_R[12]_001.fastq.gz", "", `Name in Raw Data Folder`)) %>% 
+  mutate(`Linc RNA Paper Jenny`=case_when(
+    filename %in% bulk_only$filename ~ "Yes",
+    TRUE ~ "No")) %>%
+  as.data.frame()
+
+
+
+
+table(sheet8$`Linc RNA Paper Jenny`)
+# write.csv(sheet8, "Stirewalt_SRA_Submission/stirewalt_sheet8.csv", row.names = FALSE)
+```
+
+### Blast purfied
+
+```{r}
+blasts_only <- SWOG_lncScores %>% 
+  filter(Group=="AML_blasts") %>%
+  filter(!grepl("Lim",filename)) %>%
+  group_by(SWOGID) %>% 
+  mutate(N=n()) %>% 
+  mutate(Keep=case_when(
+    N==1 ~ TRUE,
+    N==2 & sum(Fraction == "VLB")==2 & RNA.type=="miRNA" ~ TRUE)) %>%
+  ungroup() %>%
+  filter(Keep) 
+
+
+dim(blasts_only) #205
+```
+
+```{r}
+blasts_only$Patient.ID[duplicated(blasts_only$Patient.ID)] #dups are NAs
+```
+
+```{r}
+sum(duplicated(blasts_only$SWOGID))  #No duplicates
+sum(is.na(blasts_only$Patient.ID)) #31 need IDs
+length(unique(blasts_only$Patient.ID)) #162 unique samples for outcome
+table(!is.na(blasts_only$OS.days)) #98 samples have OS data
+```
+
+There are 13 patients with duplicate samples. The majority of samples have two different RNA purification preps - one which preserved mRNA (_mR_) and one which did not (_R_).  There are significant differences in the lncScore. However, only 3 have such differences that one sample is positive and one is negative. 
+
+So take the average score and reclassify? or just drop the conflicting samples as"noisy"? 
+- i decided to keep only samples with the "miRNA" extraction protocol based on the recommendation from Era P. 
+
+
+```{r}
+#For Era P. to fill in missing information
+filter(blasts_only, duplicated(Patient.ID) | duplicated(Patient.ID, fromLast = T)) %>%
+  arrange(Patient.ID) %>%
+  select(filename,SWOGID, Patient.ID, RNA.type,Seq.Method,Fraction) #%>%
+  # write.csv(., "SWOG_AML_RNA-seq_Duplicates_and_Missing_Patient.ID.csv", row.names = FALSE)
+```
+
+```{r}
+# write.csv(select(blasts_only,SWOGID,Patient.ID,
+#                  Positive_vs_Negative=lnc.Pos.Neg),
+#          "SWOG_AML_BlastEnriched_lncScore_Groups_forKMAnalysis_03.27.20.csv",
+#          row.names = FALSE)
+```
+
+
+
+#Visualize  lncRNA Scores
+
+```{r}
+library(ggpubr)
+```
+
+```{r fig.height=4, fig.width=10}
+scores_waterfall <- ggplot(SWOG_rmDups, 
+       aes(x=reorder(SWOGID,lnc.Score), y=lnc.Score,
+           fill=lnc.Percentile.Groups, 
+           color=lnc.Percentile.Groups)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold")) +
+  labs(x="Patient") 
+
+# pdf("SWOG_AML_lncScores_waterfall.pdf", height = 4, width = 10)
+scores_waterfall
+# dev.off()
+
+```
+
+```{r fig.height=4}
+LSC_waterfall <- ggplot(SWOG_rmDups,  
+       aes(x=reorder(SWOGID,LSC17.Score), y=LSC17.Score,
+           fill=LSC.Percentile.Groups, 
+           color=LSC.Percentile.Groups)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold")) +
+  labs(x="Patient") 
+
+# pdf("SWOG_AML_LSC17_Scores_waterfall.pdf", height = 4, width = 10)
+LSC_waterfall
+# dev.off()
+```
+
+
+#Visualize  lncRNA Gene Expression 
+
+```{r}
+#Expression waterfall plots of the lncRNA individual genes. 
+waterfall.plots <- lapply(grep(paste(lncRNA.Sig$gene, collapse = "|"), 
+                               colnames(SWOG_rmDups), value=TRUE), 
+                          function(x) plots(SWOG_rmDups, x, log=FALSE))
+```
+
+```{r fig.height=10, fig.width=11}
+# pdf("SWOG_AML_37_lncRNA_Signature_Expression_waterfalls.pdf", height = 10, width = 11)
+gridExtra::marrangeGrob(grobs=waterfall.plots, nrow=3, ncol=2)
+# dev.off()
+```
+
+```{r}
+#Expression waterfall plots of the LSC17 individual genes. 
+lsc.waterfall.plots <- lapply(grep(paste(LSC17$gene_id, collapse = "|"), 
+                               colnames(SWOG_rmDups), value=TRUE), 
+                          function(x) plots(SWOG_rmDups, x, log=FALSE))
+```
+
+```{r fig.height=10, fig.width=11}
+gridExtra::marrangeGrob(grobs=lsc.waterfall.plots, nrow=3, ncol=2)
+```
+
+```{r}
+ggplot(SWOG_rmDups, 
+       aes(y=LSC17.Score, x=lnc.Score, color=LSC.Percentile.Groups)) + 
+  geom_point() + 
+
+  geom_smooth(mapping=aes(x=lnc.Score, y=LSC17.Score),
+              method = "lm", inherit.aes = FALSE) #pearson cor =0.51 
+```
+
+
+#KM plots 
+
+##Bulk MRNA-seq
+```{r fig.height=5, fig.width=5}
+# SWOG_rmDups$lnc.Pos.Neg
+OS.bulk <- survfit(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=bulk_only)
+survdiff(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=bulk_only)
+summary(coxph(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=bulk_only))
+KM.bulk <- SurvivalPlot(fit=OS.bulk,LegendTitle = "", 
+                       timeUnit = "Years",
+                       colors=c("red","blue"))
+
+KM.bulk
+```
+
+
+##Mostly Blast Purified
+
+```{r}
+table(SWOG_rmDups$Group, SWOG_rmDups$RNA.type)
+```
+
+```{r fig.height=5, fig.width=5}
+# SWOG_rmDups$lnc.Pos.Neg
+OS.fit <- survfit(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=SWOG_rmDups)
+
+summary(coxph(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=SWOG_rmDups))
+survdiff(Surv(OS.days/365.25,OS.indicator) ~ lnc.Pos.Neg, data=SWOG_rmDups)
+
+
+OS.sel <- SurvivalPlot(fit=OS.fit,LegendTitle = "", 
+                       timeUnit = "Years",
+                       colors=c("red","blue"), 
+                       pval="")
+
+OS.sel
+```
+
+```{r}
+filter(SWOG_rmDups, !is.na(OS.days)) %>% 
+  select(Group,lnc.Pos.Neg) %>% 
+  table()
+```
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+#Older Reference Files
+

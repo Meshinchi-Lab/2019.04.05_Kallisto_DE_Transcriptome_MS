@@ -1,0 +1,172 @@
+---
+author: Jenny Smith 
+date: May 20, 2019
+---
+
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+# knitr::opts_knit$set(root.dir =   "/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2019.04.05_Kallisto_DE_Transcriptome_MS/")
+knitr::opts_knit$set(root.dir =   "/Volumes/fh/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2019.04.05_Kallisto_DE_Transcriptome_MS/")
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(gridExtra)
+library(DeGSEA)
+getwd()
+```
+
+
+
+# lncRNA Annotation
+
+```{r}
+lncRNA <- read.csv("/Volumes/jlsmith3/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+head(lncRNA)
+dim(lncRNA) #16066     3
+```
+
+
+#Read in the MDS/PCA plots 
+
+```{r}
+pca.mds.lnc <- readRDS("Figures/Plots_MDS_PCA_vsOthers_lncRNA.RDS")
+pca.mds.others <- readRDS("Figures/Plots_MDS_PCA_vsOthers.RDS")
+pca.mds.NBM <- readRDS("Figures/Plots_MDS_PCA_vsNBM.RDS")
+
+length(pca.mds.lnc)
+length(pca.mds.others)
+length(pca.mds.NBM)
+```
+
+```{r}
+make_grobs <- function(list.of.plots){
+  grobs.2by2 <- list() 
+  n <- length(list.of.plots)
+  
+  for(i in seq(1,n, by=2) ){
+
+    plots.title <- gsub(".PCA", "", names(list.of.plots[i]))
+    # print(plots.title)
+    
+    a <- arrangeGrob(list.of.plots[[i]],
+                    list.of.plots[[i+1]],
+                    ncol=2, nrow = 1,
+                    top= )
+    
+  
+    grobs.2by2[[plots.title]] <- a
+  }
+  
+  return(grobs.2by2)
+}
+```
+
+
+```{r}
+ml.lnc <- marrangeGrob(grobs = make_grobs(pca.mds.lnc), ncol=1, nrow=2) 
+# ggsave("Figures/TARGET_AML_PCA_MDS_AMLvsOthers.lncRNA_plots.pdf",ml.lnc, width = 10 , height = 7)
+
+```
+
+```{r}
+ml.Others <- marrangeGrob(grobs = make_grobs(pca.mds.others), ncol=1, nrow = 2)
+# ggsave("Figures/TARGET_AML_PCA_MDS_AMLvsOthers_plots.pdf", ml.Others, width = 10, height = 7)
+```
+
+```{r}
+ml.NBM <- marrangeGrob(grobs = make_grobs(pca.mds.NBM), ncol=1, nrow = 2)
+# ggsave("Figures/TARGET_AML_PCA_MDS_AMLvsNBM_plots.pdf", ml.NBM, width = 10, height = 7)
+```
+
+
+#Read in the Heatmaps 
+
+```{r}
+library(ComplexHeatmap)
+```
+
+```{r}
+save_pdfs <- function(list.of.heatmaps){
+  
+  for (i in 1:length(list.of.heatmaps)){
+      file <- paste0("Figures/",names(list.of.heatmaps[i]), ".png")
+      
+      # pdf(file=file, height = 10, width = 14)
+      png(filename = file, height = 10, width = 14, units = "in", res=150)
+      draw(list.of.heatmaps[[i]])
+      dev.off()
+  }
+  
+}
+```
+ 
+```{r}
+NBM.lnc <- readRDS("RData/AMLvsNBM_lncRNA.RDS")
+
+dim(NBM.lnc$DE$DE)
+```
+
+```{r}
+save_pdfs(list(NBM.lnc$Heatmap))
+```
+
+ 
+```{r}
+heatmaps.lncRNA <- readRDS("Figures/Heatmaps_vsOthers_lncRNA.RDS")
+length(heatmaps.lncRNA)
+```
+
+```{r}
+save_pdfs(heatmaps.lncRNA)
+rm(heatmaps.lncRNA)
+```
+
+```{r}
+heatmaps.others <- readRDS("Figures/Heatmaps_vsOthers.RDS")
+length(heatmaps.others)
+```
+
+```{r}
+save_pdfs(heatmaps.others)
+rm(heatmaps.others)
+```
+
+
+```{r}
+heatmaps.NBM <- readRDS("Figures/Heatmaps_vsNBM.RDS")
+length(heatmaps.NBM)
+names(heatmaps.NBM)
+```
+
+```{r}
+# save_pdfs(heatmaps.NBM)
+rm(heatmaps.NBM)
+```
+
+NOTE: below does not work. Runs without error but the file size never gets smaller....
+smallpdf <- tools::compactPDF(paths = "/Volumes/fh/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2019.04.05_Kallisto_DE_Transcriptome_MS/Figures/AMLvsNBM_allGenes.pdf", 
+                  gs_cmd = "/usr/local/bin/gs",
+                  gs_quality = "ebook")
+
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+

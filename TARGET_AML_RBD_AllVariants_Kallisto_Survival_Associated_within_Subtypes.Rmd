@@ -1,0 +1,1006 @@
+---
+title: 'Surivival Analysis of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "August 31, 2021"
+output: html_document
+---
+
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE, fig.align='center', fig.height=5,
+                      fig.width=8, dpi = 600)
+
+options(stringsAsFactors = FALSE)
+options(expressions = 500000)
+
+options(stringsAsFactors = FALSE,bitmapType = 'cairo')
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+# grDevices::X11.options(type='cairo')
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+
+library(DeGSEA) #my custom build R package that used to be imported through `source` 
+library(survival)
+
+library(RColorBrewer)
+library(edgeR)
+library(gtools)
+library(gridExtra)
+library(GGally)
+
+getwd()
+```
+
+
+
+#Define Functions
+
+```{r}
+cox_glmnet_workflow <- function(CDE.train,targets,
+                                IDmap,
+                                std=FALSE,
+                                N.Groups=4,
+                                oneSE=FALSE,
+                                CDE.test,
+                                CDE.validation=NULL,
+                                CDE.validation2=NULL){
+  
+  suppressPackageStartupMessages(library(glmnet))
+  #CDE.train has  patients as rows, surivival data and all genes expression values as columns.
+  #targets is a character vector with the column names of the genes of interest that will be included in the glmnet fit. 
+  #lncRNAs is IDmap for ENSG lncRNA IDs to gene name with biotype. 
+  #CDE.test has  patients as rows, surivival data and all genes expression values as columns.
+  #CDE.validation has  patients as rows, surivival data and all genes expression values as columns.
+      
+      
+      sparsemat_to_df <- function(coef){
+        #sparsemat is a sparce matrix from the output of predict(.,type="coefficients")
+        coef <- data.frame(coef=coef[,1]) %>%
+          rownames_to_column("gene") %>%
+          filter_all(all_vars(. != 0))
+        return(coef)
+      }
+      
+      #Derive the AIC for model 
+      #https://stats.stackexchange.com/questions/25817/is-it-possible-to-calculate-aic-and-bic-for-lasso-regression-models
+      AIC.stat <- function(fit,lambda.val){
+        idx <- which(fit$lambda == lambda.val) #select which model to get AIC from
+        tLL <- fit$nulldev - deviance(fit)[idx]
+        k <- fit$df[idx]
+        n <- fit$nobs
+        AICc <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+        return(AICc)
+        # BIC <- log(n)*k - tLL
+      }
+
+      
+      #character vector of input data sets
+      sets <- c("Train","Test")
+      addl <- c(!is.null(CDE.validation), !is.null(CDE.validation2))
+      if(all(addl)){sets <- c(sets,"Validation","Validation2")
+      }else if(addl[1]){sets <- c(sets,"Validation")}
+      
+      #grid of lambda values to test.
+      grid <- 10^ seq(10,-2, length=100)
+      
+      
+      ## Training 
+      x.train <- CDE.train %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(all_of(targets)) %>%  #pull(sig.ures,Variable)
+        as.matrix()
+      
+      y.train <- CDE.train %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(time="EFS.time..days.", status="Event.ID") %>%
+        as.matrix()
+      
+      # dim(y.train)
+      # dim(x.train)
+      
+      mod <- glmnet(x=x.train,
+                    y=y.train,
+                    family = "cox",
+                    standardize = std,
+                    lambda = grid)
+      
+      # plot(mod)
+      
+      
+      #Seed was set at 2021
+      set.seed(2021)
+      cv.lambda <- cv.glmnet(x=x.train, y=y.train,
+                             family = "cox",
+                             standardize = std,
+                             lambda = grid,
+                             nfolds = nrow(x.train),
+                             type.measure = "deviance")
+      
+      if(oneSE){
+        lambda <- cv.lambda$lambda.1se
+      }else{
+        lambda <- cv.lambda$lambda.min
+      }
+      
+    
+      coef.trainingMod <- predict(mod, type="coefficients", s=lambda)
+      nonZero.train <- sparsemat_to_df(coef.trainingMod) %>% 
+        arrange(desc(coef)) %>% 
+        left_join(., IDmap, by=c("gene"="gene_id")) 
+      
+      ## Testing 
+      x.test <- CDE.test %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(all_of(targets)) %>% 
+        as.matrix()
+
+      
+      #predict the surival outcome. Returns relative risk of each patient
+      pred.outcome <- predict(mod, 
+                              newx = x.test,
+                              type="response",
+                              s=lambda) 
+  
+      #Model AIC 
+      AIC <- AIC.stat(fit = cv.lambda$glmnet.fit, lambda.val=lambda)
+      
+      
+      ##Apply the Score 
+      rm.genes <- setdiff(grep("^ENSG", colnames(CDE.train), value=TRUE),
+                          nonZero.train$gene) #genes NOT selected in Model
+      Model.Comparison.df <- CDE.train %>% 
+        bind_rows(CDE.test,CDE.validation,CDE.validation2) %>%
+        select(USI,Set,everything(),-all_of(rm.genes)) %>%  
+        select(USI,Set,all_of(nonZero.train$gene),everything()) %>% #ensure CORRECT ORDER of gene expression columns 
+        mutate(lnc.Score=apply(dplyr::select(., starts_with("ENSG")), 1,
+                               function(x) sum(x*nonZero.train$coef)))#apply the score calculation 
+      
+      #Exception handling if score ends up having very low variability.
+      N=N.Groups
+      perc.labs <- function(N){paste0("q",1:N)}
+      e <- try(group_by(Model.Comparison.df, Set) %>% 
+                  mutate(TEST=quantcut(lnc.Score, q=N, na.rm=FALSE, labels=perc.labs(N))), 
+               silent = TRUE)
+      if(inherits(e,"try-error")){N=3}
+    
+      
+      #Create Median/Percentile Groups
+      Model.Comparison.df <- Model.Comparison.df %>%
+        group_by(Set) %>% 
+        mutate(lnc.Median.Groups=factor(ifelse(lnc.Score >= median(lnc.Score), "high", "low"),
+                                        levels=c("low", "high")), 
+               lnc.Percentile.Groups=as.factor(quantcut(lnc.Score, q=N, na.rm=FALSE, 
+                                                        labels=perc.labs(N)))) %>%
+        arrange(desc(lnc.Score)) %>%
+        ungroup() %>% 
+        mutate(Set=factor(Set, levels = sets))
+        
+      
+      #Model formulas
+      y1 <- c("OS.time..days.","OS.ID")
+      y2 <- c("EFS.time..days.","Event.ID")
+      make_form <- function(response,covariate){ 
+        as.formula(paste0("Surv(", response[1],"/365.25", ",",response[2], ")~ ",covariate))
+      }
+      
+      #Examine how the model score delineates risk groups.
+      error.metrics <- Model.Comparison.df %>%
+        group_by(Set) %>%
+        do(cox.OSmedianGroups=coxph(make_form(y1, "lnc.Median.Groups"), data = .),
+           cox.EFSmedianGroups=coxph(make_form(y2, "lnc.Median.Groups"), data = .),
+           
+           cox.OSpercentileGroups=coxph(make_form(y1, "lnc.Percentile.Groups"), data = .),
+           cox.EFSpercentileGroups=coxph(make_form(y2, "lnc.Percentile.Groups"), data = .),
+           
+           
+           cox.OScontinuous=coxph(make_form(y1, "lnc.Score"), data = .),
+           cox.EFScontinuous=coxph(make_form(y2, "lnc.Score"), data = .),
+           
+           KM.OS.Med=SurvivalPlot(survfit(make_form(y1, "lnc.Median.Groups"), data=.), #survival plots
+                              LegendTitle = "OS",
+                              timeUnit = "Years",
+                              colors = c("high"="red", "low"="dodgerblue")),
+           KM.EFS.Med=SurvivalPlot(survfit(make_form(y2, "lnc.Median.Groups"), data=.),
+                               LegendTitle="EFS",
+                               timeUnit= "Years",
+                               colors= c("high"="red", "low"="dodgerblue")), 
+           
+           KM.OS.Perc=SurvivalPlot(survfit(make_form(y1, "lnc.Percentile.Groups"), data=.), #survival plots
+                              LegendTitle = "OS",
+                              timeUnit = "Years",
+                              colors = "gg.def"),
+           KM.EFS.Perc=SurvivalPlot(survfit(make_form(y2, "lnc.Percentile.Groups"), data=.),
+                               LegendTitle="EFS",
+                               timeUnit= "Years",
+                               colors= "gg.def")) %>% 
+        ungroup() %>% 
+        mutate(Set=factor(Set, levels=sets)) %>% 
+        arrange(Set)
+  
+  #Final results 
+  res <- list(mod,cv.lambda,nonZero.train,Model.Comparison.df,error.metrics,AIC)  
+  names(res) <- c("training.model","cv.lambda","nonZero.train.coef","Model.Comparison.df","error.metrics","AIC")
+  
+  return(res)    
+}
+
+
+#Collapse the error metrics tibble into a dataframe
+extract_metrics_df <- function(error.metrics.tibble,V=FALSE, V2=FALSE){
+  Names <- names(error.metrics.tibble[2:7])
+  sets <- c("Train","Test")
+  
+  addl <- c(V, V2)
+  if(all(addl)){sets <- c(sets,"Validation","Validation2")
+  }else if(addl[1]){sets <- c(sets,"Validation")}
+  
+  N <- length(sets)
+  
+  res <- lapply(Names, 
+       function(x) lapply(error.metrics.tibble[[x]], coxSummaryTable) %>% 
+         lapply(., function(x) mutate(x,Levels=nrow(x))) %>%
+         bind_rows() %>% 
+         mutate(Comparison=x,Set=rep(sets, each=unique(Levels)))) %>% 
+  bind_rows() %>% 
+  select(Comparison, Set, everything())
+  
+  return(res)
+}
+```
+
+
+```{r}
+cox_reg <- function(gene_name,CDE,variables=NULL, OS=FALSE){
+  
+  if(OS){
+    KM <- Surv(time=CDE$OS.time..days., event = CDE$OS.ID)
+  }else{
+     KM <- Surv(time=CDE$EFS.time..days., event = CDE$Event.ID)
+  }
+ 
+  
+  if(is.null(variables)){
+    variables <- gene_name
+  }else{
+    variables <- paste(c(gene_name,variables),collapse = "+")
+  }
+  
+  formula <- as.formula(paste("KM",variables, sep=" ~ ")) 
+
+  c1 <- coxph(formula, data=CDE)
+  tab <- coxSummaryTable(c1)
+  
+  return(tab)
+}
+```
+
+```{r}
+plots <- function(Model.Comparison.df, Gene.Col,log=FALSE, type="wfall"){
+  library(ggpubr)
+  if(!log){Model.Comparison.df[,Gene.Col] <- 2^(Model.Comparison.df[,Gene.Col]-1)} #non-log2
+  
+  if(type=="wfall"){
+   p <- ggbarplot(Model.Comparison.df, 
+            x = "USI", y = Gene.Col,
+          fill = "lnc.Percentile.Groups",               # change fill color by cyl
+          color = "lnc.Percentile.Groups",            # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          sort.val = "asc",           # Sort the value in dscending order
+          sort.by.groups = FALSE,      # Sort inside each group
+          x.text.angle = 90,           # Rotate vertically x axis texts
+          facet.by = "Set",
+          scales="free") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  if(type=="box"){
+   p <- ggboxplot(Model.Comparison.df, 
+          x = "lnc.Percentile.Groups", y = Gene.Col, 
+          fill = "lnc.Percentile.Groups",               
+          palette = "jco",            
+          sort.val = "asc",           
+          sort.by.groups = FALSE,      
+          x.text.angle = 90,           
+          facet.by = "Set",
+          scales="fixed") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  return(p)
+}
+```
+
+```{r}
+xtile <- function(names,exp_vals,sdfp,survival_type){
+  require('dplyr')
+  #names = patient names
+  #exp_vals = expression levels of that gene for each patient listed in names
+  #sdfp = survival data (Event and Time to Event) for each patient listed in names
+  #survival_type = "OS" or "EFS"
+  names(exp_vals) = as.character(names)
+  exp_vals_sorted = sort(exp_vals)
+  sdfp = sdfp[names(exp_vals_sorted),]
+  best_p_val = 1
+  best_i = 1
+  p_values = c()
+  for(i in floor(length(exp_vals_sorted)*0.1):(ceiling(length(exp_vals_sorted)*0.9))){
+    c_clusters = c(rep("A",i),rep("B",(length(exp_vals_sorted)-i)))
+    if(survival_type=="OS"){
+      sd = survdiff(Surv(OS_time_years, OS_event_ID==1 ) ~ c_clusters, data=sdfp)
+      coxvar = try(coxph(formula = Surv(OS_time_years, OS_event_ID==1 ) ~ c_clusters, data = sdfp))
+    }
+    if(survival_type=="EFS"){
+      sd = survdiff(Surv(EFS_time_years, EFS_event_type_ID==1 ) ~ c_clusters, data=sdfp)
+      coxvar = try(coxph(formula = Surv(EFS_time_years, EFS_event_type_ID==1 ) ~ c_clusters, data = sdfp))
+    }
+    p_values = c(p_values,summary(coxvar)$coefficient[5])
+    p_val = 1 - pchisq(sd$chisq, 1)
+    if(as.numeric(p_val)<as.numeric(best_p_val)){
+      best_i = i
+      best_p_val = p_val
+    }
+  }
+  
+  GROUPA = names(exp_vals_sorted[1:best_i])
+  GROUPB = names(exp_vals_sorted[(best_i+1):length(exp_vals_sorted)])
+  groupings = ifelse(names%in%GROUPA,"Low","High")
+  cut_point = mean(exp_vals_sorted[best_i:(best_i+1)])
+  r_data = list(groupings,cut_point)
+  names(r_data) = c("Groupings","Cut_Point")
+  return(r_data)
+}
+```
+
+
+# Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                   row.names = 1, na.strings = c("N/A","NA","#N/A","^\\.$", "^$"))
+
+inelig <-   filter(merged, Eligibility_Comments == "remove") %>%  
+  pull(USI)
+  
+merged <- merged %>%
+  filter(!is.na(USI),
+         !grepl( "Unknown", USI)) %>%
+  filter(!is.na(EFS.time..days.)) %>%
+  filter(Eligibility_Comments != "remove") %>% 
+  set_rownames(.$USI)
+
+head(merged[,1:5])
+dim(merged) #2093  149
+```
+
+```{r eval=TRUE}
+manifest <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(manifest) #3054   17
+head(manifest)
+# table(manifest$dx_rlps_pair) #849 pairs? 
+```
+
+
+# Read in the counts
+
+```{r}
+cts <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_JMML_APL_DS_MDAnderson_Kallisto_Quant_GeneLevel_dupGenesRemoved_scaledTPM_counts.RDS"))
+colnames(cts)[grep("PATGIG|PATISD", colnames(cts))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(cts), value=T))
+
+geneIDs <- cts[,1:2]
+rownames(cts) <- cts$gene_name
+cts <- cts[,-c(1:2)]
+
+dim(cts) #58263  3021
+head(cts[,1:5]) 
+```
+
+
+
+#Read in the Gene Annotations
+
+```{r}
+IDmap <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>% 
+  filter(gene_id %in% geneIDs$gene_id)
+
+# head(IDmap)
+dim(IDmap)
+```
+
+```{r}
+lncRNAs <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv"), row.names = 1) %>% 
+  filter(gene_id %in% geneIDs$gene_id) %>% 
+  set_rownames(.$gene_id)
+
+
+# head(lncRNAs)
+dim(lncRNAs)
+table(lncRNAs$gene_type)
+```
+
+```{r}
+LSC17 <- read.csv(file.path(PROJHOME,"2017.02.28_LSC17_Score/LSC17_Genes_Coeff.csv")) %>% 
+  mutate(LSC_alias=case_when(
+    LSC_genes =="KIAA0125" ~ "FAM30A", 
+    LSC_genes == "NGFRAP1" ~ "BEX3", 
+    LSC_genes == "GPR56" ~ "ADGRG1", 
+    TRUE ~ LSC_alias)) %>% 
+  left_join(., select(IDmap,gene_id, gene_name),
+            by=c("LSC_genes"="gene_name")) %>% 
+  left_join(., select(IDmap,gene_id, gene_name),
+            by=c("LSC_alias"="gene_name")) %>% 
+  mutate(gene_id=ifelse(is.na(gene_id.x), gene_id.y, gene_id.x)) %>% 
+  select(-matches("\\.x|\\.y"))
+  # filter(is.na(gene_id))
+
+```
+
+Alias: 
+
+FAM30A == KIAA0125
+BEX3 == NGFRAP1
+ADGRG1== GPR56
+
+
+# Define Samples 
+
+```{r}
+original.cohort <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")$Model.Comparison.df %>% 
+  select(-matches("^ENSG")) %>% 
+  filter(!USI %in% inelig)
+
+# head(original.cohort)
+dim(original.cohort) #1298  168
+```
+
+```{r}
+original.mod <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")
+```
+
+```{r}
+table(original.cohort$Set)
+```
+
+```{r}
+library(randomizr)
+set.seed(2021)
+  
+sample_info <- manifest %>% 
+  filter(grepl("NBM|AML$", Group), grepl("NBM|diagnostic", Time_point)) %>% 
+  filter(!grepl("_replicate", Sample)) %>% 
+  filter(!USI %in% inelig) %>% 
+  filter(Sample %in% colnames(cts)) %>% 
+  
+  left_join(., select(merged, USI, Cyto.Fusion.Molecular.Risk_update, 
+                      matches("EFS|OS|Event|ISCN|FLT3.ITD|NPM|CEBPA"),ETS_Fusion,Treatment.Arm), 
+            by="USI") %>% 
+  filter(Group=="NBM" | !is.na(EFS.time..days.)) %>% 
+  
+  mutate(Sequencing_Cohort="RBS", #ORIGINAL CODE for blocked randomization
+         AML="AML",
+         Major.Group_update=case_when(
+                      grepl("CBFA2T3-GLIS2",Primary.Fusion) ~ "CBFA2T3-GLIS2",
+                      grepl("NUP98-NSD1|NSD1-NUP98",Primary.Fusion) ~ "NUP98-NSD1",
+                      grepl("NUP98-KDM5A|KDM5A-NUP98",Primary.Fusion) ~ "NUP98-KDM5A",
+                      grepl("DEK-NUP214", Primary.Fusion) ~ "DEK-NUP214",
+
+                      grepl("RBM15-MKL1",Primary.Fusion) ~ "RBM15-MKL1",
+                      grepl("RUNX1-CBFA2T3",Primary.Fusion) ~ "RUNX1-CBFA2T3", 
+                      grepl("NPM1-MLF1",Primary.Fusion) ~ "NPM1-MLF1", 
+                      
+                      grepl("RUNX1-RUNX1T1", Primary.Fusion) ~ "RUNX1-RUNX1T1",
+                      grepl("CBFB-MYH11", Primary.Fusion) ~ "CBFB-MYH11",
+                      grepl("KMT2A-|-KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV)  ~ "KMT2A",
+
+                      grepl("NUP98",Primary.Fusion) &
+                        !grepl("NUP98-KDM5A|NUP98-NSD1",Primary.Fusion)~ "NUP98-Other",
+                      grepl("MLLT10", Primary.Fusion) & !grepl("KMT2A", Additional.Fusions.CNV) ~ "MLLT10",
+                      grepl("KAT6A", Primary.Fusion) | grepl("KAT6A", Additional.Fusions.CNV) |
+                         grepl("t\\(8;16\\)\\(p11.2;p13.3\\)", ISCN) ~ "KAT6A",
+                      grepl("ETV6", ETS_Fusion) ~ "ETS-ETV6",
+                      grepl("ETS-Other|FUS-ERG", ETS_Fusion) ~ "ETS-Other",
+                    
+
+                      grepl("monosomy7", Primary.CNV)  ~ "monosomy7",
+                      # grepl("del5q", Primary.CNV) ~ "del5q", #only 5 patients, so a little confusing
+                      FLT3.ITD.allelic.ratio > 0.1 ~ "FLT3.ITD",
+                      NPM.mutation. == "Yes" ~ "NPM1",
+                      CEBPA.mutation. == "Yes" ~ "CEBPA",
+                      Group=="NBM" ~ Group,
+                      TRUE ~ "OtherAML")) %>% 
+  
+  group_by(Major.Group_update, Primary.Fusion) %>% 
+  mutate(KMT2A_Groups=case_when(
+    Major.Group_update=="KMT2A" & n() >= 10 ~ Primary.Fusion, 
+     Major.Group_update=="KMT2A" & n() < 10 ~ Major.Group_update,
+    TRUE ~ "")) %>% 
+  ungroup() %>% 
+  
+  group_by(Major.Group_update) %>% 
+  mutate(AML_Subtype=case_when(
+    grepl("NUP98", Major.Group_update) ~ "NUP98",
+    n() < 40 & Major.Group_update != "CBFA2T3-GLIS2" ~ "OtherAML",
+    TRUE ~ gsub("-",".", Major.Group_update))) %>% 
+  mutate(Fusion_Classes=case_when(
+    grepl("KMT2A", Major.Group_update) ~ KMT2A_Groups,
+    TRUE ~ Major.Group_update)) %>% 
+  ungroup() %>% 
+  
+  left_join(., select(original.cohort, USI, Set), 
+            by="USI") 
+
+ 
+dim(sample_info)
+table(sample_info$Group)
+```
+ 
+ 
+# Discrepant Samples
+
+```{r}
+# to_check <- c(PANTNA
+# PANVUF
+# PANTCT
+# PATIHH
+# PATCXL
+# PASCFS
+# PASHHH
+# PASWVH
+# PARYGA
+# PATJUT
+# PAVYKS
+# PAXBVX
+# PAVHML
+# PAXLXM
+# PAVLEG
+# PAUSZL
+# PAVAYH
+# PAVJXG
+# PAWSWU
+# PAWAIG
+# PAVPED
+# PAXDVZ
+# PAWTEB
+# PAVLSY
+# "PAWRIY", "PAKTCX", "PAKLPD", "PAKIWK")
+```
+
+
+```{r}
+discrepant <- original.cohort %>% 
+  filter(MRD.at.end.of.course.1=="Unknown", Cyto.Fusion.Molecular.Risk_update=="Standard") %>% 
+  select(USI, Set, Protocol, Cyto.Fusion.Molecular.Risk_update, matches("MRD"),
+         matches("Primary.Fusion|Primary.CNV|mutation|FLT3.ITD")) %>% 
+  arrange(Set,Protocol)
+
+
+discrepant
+```
+
+```{r}
+table(discrepant$Protocol)
+```
+
+
+ 
+# Define Train and Test Set 
+
+```{r}
+CDE.train <- sample_info %>% 
+  filter(grepl("Train", Set))
+
+
+dim(CDE.train) #780  50
+table(CDE.train$Cyto.Fusion.Molecular.Risk_update)
+```
+
+```{r}
+CDE.test <-  sample_info %>% 
+  filter(!grepl("Train", Set), Group!="NBM") %>% 
+  mutate_at(vars(Set), ~factor(ifelse(is.na(.),"Test",as.character("Test")),
+                               levels=c("Train","Test")))
+  
+dim(CDE.test)
+table(CDE.test$Cyto.Fusion.Molecular.Risk_update)
+```
+
+
+## Any Significantly Different Frequencies in Train vs Test
+
+```{r}
+forComp <- bind_rows(CDE.train, CDE.test) %>% 
+  select(Sample, Set, Fusion_Classes) %>% 
+  mutate(value=Fusion_Classes) %>%
+  pivot_wider(names_from=Fusion_Classes, values_from=value) %>%
+  rename_all(~gsub("-",".", .)) %>% 
+  mutate_at(vars(NUP98.NSD1:KMT2A.SEPT6), ~replace_na(.,replace = "other"))
+
+# head(forComp)
+
+cols <- select(forComp,NUP98.NSD1:KMT2A.SEPT6) %>% 
+  colnames()
+
+sig_diffs <- sapply(cols, function(x){
+  
+  mat <- forComp %>% 
+    group_by(Set, !!as.name(x)) %>% 
+    count() %>% 
+    pivot_wider(names_from=Set, values_from=n) %>% 
+    column_to_rownames(x)
+
+  if(any(mat < 10)){
+    fisher.test(mat, alternative = "two.sided")$p.value
+  }else{
+    chisq.test(mat)$p.value
+  }
+})
+
+
+sig_diffs[order(sig_diffs)]
+```
+
+
+
+
+
+
+# Subset and Normalize Counts
+
+```{r}
+in_cts <- cts[,sample_info$Sample]
+
+dim(in_cts)
+```
+
+```{r}
+AML <- ! grepl("BM[0-9]|R[O0][0-9]", colnames(in_cts))
+keep <- rowSums(cpm(in_cts[,AML]) >= 1) >= 0.01*ncol(in_cts[,AML])
+cts.filtered <- in_cts[keep, ]
+
+dge <- DGEList(counts=cts.filtered)
+dge <- calcNormFactors(dge,method = "TMMwsp")
+
+logCPM <- edgeR::cpm(dge,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM <- edgeR::cpm(dge,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM) #30704  1454
+head(logCPM[,1:5])
+```
+
+
+```{r}
+lnc_37_expn_data <- logCPM[original.mod$nonZero.train.coef$gene_name, ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene_name") %>% 
+  pivot_longer(.,matches("^TARGET"),names_to="Sample",values_to="logCPM") %>% 
+  left_join(., select(lncRNAs, gene_id, gene_name), 
+            by="gene_name") %>% 
+  pivot_wider(id_cols = Sample, names_from=gene_id,values_from=logCPM)
+
+head(lnc_37_expn_data)
+dim(lnc_37_expn_data)
+```
+
+
+
+
+# Model fit with LASSO Cox Regression
+
+## Re-fit on the 37
+
+```{r}
+models_1 <- lapply(c( "High","Low","Standard"), function(group){
+  
+  # print(group)
+  
+  in.train <- CDE.train %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==group) %>% 
+      left_join(., lnc_37_expn_data, by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  # print(dim(CDE.train))
+  
+  in.test <- CDE.test %>% 
+      left_join(., lnc_37_expn_data, by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  # print(dim(CDE.test))
+  
+  lncs <- in.train %>% 
+    select(matches("^ENSG")) %>% 
+    colnames()
+  
+  # print(head(lncs))
+  
+  cox_glmnet_workflow(CDE.train = in.train,
+                      targets = lncs,
+                      IDmap = lncRNAs,
+                      CDE.test = in.test)
+  
+  
+})
+
+
+names(models_1) <- c( "High","Low","Standard")
+```
+
+```{r}
+models_1$High$nonZero.train.coef
+models_1$High$error.metrics
+```
+
+```{r fig.height=10, fig.width=10}
+# models_1$High$error.metrics
+
+
+grid.arrange(grobs=c(models_1$High$error.metrics$KM.OS.Perc,
+                     models_1$High$error.metrics$KM.EFS.Perc), ncol=2, nrow=2)
+
+grid.arrange(grobs=c(models_1$High$error.metrics$KM.OS.Med,
+                     models_1$High$error.metrics$KM.EFS.Med), ncol=2, nrow=2)
+# models_1$High$error.metrics$cox.OSmedianGroups
+# models_1$High$error.metrics$cox.EFSmedianGroups
+```
+
+```{r fig.height=10, fig.width=10}
+grid.arrange(grobs=c(models_1$Standard$error.metrics$KM.OS.Perc,
+                     models_1$Standard$error.metrics$KM.EFS.Perc), ncol=2, nrow=2)
+
+grid.arrange(grobs=c(models_1$Standard$error.metrics$KM.OS.Med,
+                     models_1$Standard$error.metrics$KM.EFS.Med), ncol=2, nrow=2)
+
+```
+
+
+```{r fig.height=10, fig.width=10}
+grid.arrange(grobs=c(models_1$Low$error.metrics$KM.OS.Perc,
+                     models_1$Low$error.metrics$KM.EFS.Perc), ncol=2, nrow=2)
+
+grid.arrange(grobs=c(models_1$Low$error.metrics$KM.OS.Med,
+                     models_1$Low$error.metrics$KM.EFS.Med), ncol=2, nrow=2)
+```
+
+
+
+## DE with AML vs NBM in training set
+
+```{r}
+set.seed(2021)
+
+CDE_newModels <- sample_info %>% 
+  group_by(Cyto.Fusion.Molecular.Risk_update) %>%
+  mutate(blocks=paste(Fusion_Classes,Treatment.Arm, sep=": ")) %>%
+  mutate(Set=block_ra(blocks = blocks,
+                   prob_each = c(0.5,0.5),
+                   num_arms=2,
+                   conditions = c("Train","Test"))) %>%
+  ungroup() %>%
+  mutate_at(vars(Set), ~factor(ifelse(Group=="NBM","Train", as.character(.)),
+                               levels=c("Train","Test")))
+
+
+
+dim(CDE_newModels)
+table(CDE_newModels$Set, CDE_newModels$Cyto.Fusion.Molecular.Risk_update)
+table(CDE_newModels$Fusion_Classes,CDE_newModels$Set)
+
+
+# write.csv( CDE_newModels,"TARGET_AML_lncRNA_modeling_within_risk_groups_cohort_9.1.21.csv", row.names = FALSE)
+```
+
+```{r}
+CDE.train_DE_Samples <- CDE_newModels %>% 
+  filter(Set=="Train" | Group=="NBM") %>% 
+  as.data.frame() %>% 
+  set_rownames(.$Sample)
+
+
+# table(CDE.train_DE_Samples$AML_Subtype)
+# table(CDE.train_DE_Samples$Cyto.Fusion.Molecular.Risk_update)
+# dim(CDE.train_DE_Samples)
+```
+
+```{r}
+groups <- unique(CDE.train_DE_Samples$Cyto.Fusion.Molecular.Risk_update[!is.na(CDE.train_DE_Samples$Cyto.Fusion.Molecular.Risk_update)])
+
+AMLvsNBM <- lapply(groups, function(risk_group){
+    
+  
+    df <- CDE.train_DE_Samples %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==risk_group | Group=="NBM") %>% 
+      mutate_at(vars(Cyto.Fusion.Molecular.Risk_update), ~ifelse(is.na(.), Group, .))
+    
+    p <- df %>% 
+      pull(Cyto.Fusion.Molecular.Risk_update) %>% 
+      set_names(df$Sample)
+    
+    print(table(p))
+    
+    DE <- voom_DE(expnData = in_cts[,pull(df, Sample)],
+                  pheno = p,
+                  percent=0.05, 
+                  ref =  "NBM",
+                  GOI=lncRNAs$gene_name)
+  
+})
+
+names(AMLvsNBM) <- groups
+
+
+# saveRDS(AMLvsNBM, "TARGET_AML_vs_NBM_within_risk_groups_DE_results.RDS")
+```
+
+```{r}
+DE.lncRNAs <- lapply(AMLvsNBM, function(res){
+  res$DE %>% 
+      rownames_to_column("gene_name") %>% 
+      left_join(., lncRNAs, by="gene_name") %>% 
+      filter(adj.P.Val < 0.001) %>% 
+      arrange(desc(logFC))
+})
+
+names(AMLvsNBM) <- groups
+```
+
+```{r}
+# names(AMLvsNBM)
+logCPM.transposed <- logCPM %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene_name") %>% 
+  inner_join(., select(lncRNAs,gene_name, gene_id),
+            by="gene_name") %>% 
+  select(gene_id,gene_name, everything(),-gene_name) %>% 
+  pivot_longer(matches("TARGET"),names_to="Sample", values_to="logCPM") %>%
+  pivot_wider(id_cols = Sample, names_from=gene_id, values_from=logCPM)
+
+
+# head(logCPM.transposed)
+dim(logCPM.transposed)
+# table(CDE.train_DE_Samples$Cyto.Fusion.Molecular.Risk_update, CDE.train_DE_Samples$AML_Subtype)
+```
+
+```{r}
+sapply(DE.lncRNAs, dim)
+lapply(DE.lncRNAs, head)
+lapply(DE.lncRNAs, tail)
+sapply(DE.lncRNAs, function(x) table(x$gene_id %in% colnames(logCPM.transposed)))
+```
+
+## All DEGs 
+
+```{r}
+models_2 <- lapply(c( "High","Low","Standard"), function(group){
+  
+  print(group)
+  
+  lncs <- DE.lncRNAs[[group]] %>%  
+    filter(adj.P.Val < 0.001) %>% 
+    pull(gene_id)
+  
+  print(head(lncs))
+  
+  in.train <- CDE_newModels %>% 
+      filter(Set=="Train") %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==group) %>% 
+      left_join(., select(logCPM.transposed, "Sample", all_of(lncs)), 
+                by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  print(dim(in.train))
+  
+  in.test <- CDE_newModels %>% 
+      filter(Set=="Test") %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==group) %>% 
+      left_join(., select(logCPM.transposed, "Sample", all_of(lncs)), 
+                by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  print(dim(in.test))
+  
+
+  
+  cox_glmnet_workflow(CDE.train = in.train,
+                      targets = lncs,
+                      IDmap = lncRNAs,
+                      CDE.test = in.test)
+  
+  
+})
+
+
+names(models_2) <- c( "High","Low","Standard")
+
+# saveRDS(models_2, "TARGET_AML_lncRNA_models_within_Risk_Groups_all_DEGs.RDS")
+```
+
+```{r fig.height=7, fig.width=10}
+# models_2$High$error.metrics$KM.OS.Med
+# models_2$High$error.metrics$KM.EFS.Med
+# 
+# models_2$Standard$error.metrics$KM.OS.Med
+# models_2$Standard$error.metrics$KM.EFS.Med
+# 
+# models_2$Low$error.metrics$KM.OS.Med
+# models_2$Low$error.metrics$KM.EFS.Med
+```
+
+
+## All Upreg DEGs 
+
+```{r}
+models_3 <- lapply(c( "High","Low","Standard"), function(group){
+  
+  print(group)
+  
+  lncs <- DE.lncRNAs[[group]] %>% 
+    filter(logFC > 0,adj.P.Val < 0.001) %>%  
+    pull(gene_id )
+  
+  print(head(lncs))
+  print(length(lncs))
+  
+  in.train <- CDE_newModels %>% 
+      filter(Set=="Train") %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==group) %>% 
+      left_join(., select(logCPM.transposed, "Sample", all_of(lncs)), 
+                by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  print(dim(in.train))
+  
+  in.test <- CDE_newModels %>% 
+      filter(Set=="Test") %>% 
+      filter(Cyto.Fusion.Molecular.Risk_update==group) %>% 
+      left_join(., select(logCPM.transposed, "Sample", all_of(lncs)), 
+                by="Sample") %>% 
+      as.data.frame() %>% 
+      set_rownames(.$Sample)
+  
+  print(dim(in.test))
+  
+
+  
+  cox_glmnet_workflow(CDE.train = in.train,
+                      targets = lncs,
+                      IDmap = lncRNAs,
+                      CDE.test = in.test)
+  
+  
+})
+
+
+# names(models_3) <- c( "High","Low","Standard")
+# saveRDS(models_3, "TARGET_AML_lncRNA_models_within_Risk_Groups_all_Up_DEGs.RDS")
+```
+
+```{r}
+
+```
+
+
+# Session Info
+
+```{r}
+session_info()
+```
+

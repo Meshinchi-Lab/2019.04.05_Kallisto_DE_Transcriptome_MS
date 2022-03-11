@@ -1,0 +1,249 @@
+---
+title: 'Unsupervised clustering of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 16, 2019"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+options(stringsAsFactors = FALSE)
+options(expressions = 500000)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(DeGSEA) #my custom build R package that used to be imported through `source()`
+library(edgeR)
+library(pheatmap)
+library(RColorBrewer)
+library(readr)
+library(matrixStats)
+getwd()
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.4.19.csv"))
+
+
+merged <- merged %>% 
+  filter(!is.na(USI)) %>% 
+  filter(!is.na(EFS.time..days.)) %>%
+  set_rownames(.$USI)
+
+head(merged[,1:5])
+dim(merged)
+```
+
+
+#Reference Data
+
+```{r}
+lncRNAs <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+head(lncRNAs)
+dim(lncRNAs)
+
+table(lncRNAs$gene_type)
+```
+
+```{r}
+#https://www.gencodegenes.org/pages/biotypes.html
+IDmap <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno.csv")
+
+
+genes <- IDmap %>% 
+  filter(!gene_id %in% lncRNAs$gene_id) %>% 
+  filter(!gene_type %in% c("miRNA","sRNA","scaRNA","rRNA","snRNA","scRNA",
+                           "vaultRNA","transposable element","snoRNA","misc_RNA")) %>% 
+  filter(!grepl("pseudogene",gene_type))
+
+# dim(genes)
+# table(genes$gene_type)
+# head(IDmap)
+# dim(IDmap)
+```
+
+
+#Read in the counts
+
+```{r, eval=TRUE, message=FALSE}
+se <- readRDS("NMF/TARGET_AML_RBD_log2TMMCPM_AML.only_lncRNAs_forNMF_SummarizedExperiment.RDS")
+```
+
+```{r}
+#keep only those used in the survival analyses
+se <- se[,colnames(se) %in% merged$USI] 
+se
+```
+
+
+#DEGs Results 
+
+```{r}
+DEGs.NBM <- read.csv("DEGs/AMLvsNBM_lncRNA_DEGs.csv")
+
+dim(DEGs.NBM) #1325   10
+```
+
+```{r}
+DEGs.NBM.lncs <- DEGs.NBM %>% 
+  filter(gene %in% rownames(log2.CPM.aml))  %>% 
+  filter(adj.P.Val < 0.001)
+
+
+quantile(DEGs.NBM.lncs$logFC) 
+dim(DEGs.NBM.lncs)#849  10
+```
+
+
+#Non-Specific Filtering
+
+Try median absolute deviation (MAD)
+
+```{r}
+# calculate the variance for each gene
+rv <- rowVars(exprs(se)) %>% 
+  set_names(., rownames(se))
+
+# select the ntop genes by variance
+select <- order(rv, decreasing=TRUE)[1:1000]
+
+# head(rv[select])
+se.rv <- exprs(se[select,])
+dim(se.rv)
+```
+
+```{r}
+idx <- which(rowMeans(exprs(se)) >= 1)
+#2967 lncRNAs/5820 meet this criteria in idx
+
+means <- rowMeans2(exprs(se[idx,]))
+sd <- rowSds(exprs(se[idx,]))
+cv <- sd/means*100
+
+sel.cv <- order(cv,decreasing = TRUE)[1:1000]
+se.cv <- exprs(se[idx,])[sel.cv,]
+# head(se.cv[,1:5])
+dim(se.cv)
+```
+
+
+
+
+
+
+# NMF Clustering 
+
+*From Tim Triche*
+NNLM
+https://cran.r-project.org/web/packages/NNLM/index.html
+
+It is absurdly powerful. Also the vignette is the best of its type by a country mile
+https://www.bioconductor.org/packages/release/bioc/html/ConsensusClusterPlus.html
+BioconductorBioconductor
+
+ConsensusClusterPlus
+algorithm for determining cluster count and membership by stability evidence in unsupervised analysis(318 kB)
+Use CCP for the tracking plots
+I never understood why BCCA used NMF (the package). It kind of sucks.
+If you want to really beat on the data, feed it to MultiPLIER to transfer learn across everything on SRA, or projectR for cross data types
+I would dearly love to process the TARGET pAML data the way that Recount did TCGA (and the rest of SRA)
+Then we could do both.
+MultiPLIER first does a constrained NMF, then matches that to gene sets from factorizing everything in SRA that might be relevant
+projectR instead transfer learns across data types
+They both use NMF (or Bayesian NMF with atomic priors) as their engine.
+
+
+```{r}
+library(NNLM)
+library(ConsensusClusterPlus)
+```
+
+```{r message=FALSE}
+se <- readRDS("NMF/TARGET_AML_RBD_TMMCPM_AML.only_lncRNAs_forNMF_SummarizedExperiment.RDS")
+
+se
+```
+
+```{r}
+set.seed(2019)
+k <- 5
+dat.1 <- se[select,]
+init <- list(W = matrix(runif(nrow(dat.1)*k), ncol = k),
+             H = matrix(runif(ncol(dat.1)*k), nrow = k))
+
+nmf.1 <- nnmf(A=exprs(dat.1),
+              k=k,
+              init=init,
+              method="scd", 
+              loss = "mse",
+              trace = 1,
+              max.iter = 5000,
+              n.threads = 16)
+
+nmf.1
+```
+
+```{r}
+head(nmf.1$W[order(nmf.1$W[,1], decreasing = T),]) #1000 by 2 #meta-genes,
+# head(nmf.1$H[,1:5]) #expression profile of metagenes W
+# dim(nmf.1$H) #2 1394
+```
+
+```{r}
+#These genes, despite being highly varied in expression, do not seem to have expression patterns that are good for differentiation any differences among the genes. I think that the issue is #ENSG00000283907 which is literally 1000x more than most other genes. Log2/log10 of W matrix does not help....
+heatmap(log10(nmf.1$W+1), 
+        Colv = NA, 
+        xlab = 'Meta-gene', 
+        ylab = 'Gene',
+        margins = c(2,2),
+        labRow = '', 
+        labCol = '', 
+        scale = 'column', #why so little variation in the gene contributions to metagenes????
+        col = cm.colors(299));
+```
+
+```{r}
+nmf.1$mse
+nmf.1$target.loss
+nmf.1$average.epochs
+```
+
+```{r}
+heatmap(decomp$H, Rowv = NA, ylab = 'Meta-gene', xlab = 'Patient', margins = c(2,2),
+labRow = '', labCol = '', scale = 'row', col = cm.colors(100))
+```
+
+```{r}
+pred.a <- predict(nmf.1,which="A")
+str(pred.a)
+head(pred.a[,1:5])
+```
+
+```{r}
+#predict new 
+newH <- predict(decomp, nsclc[, 81:100], which = 'H');
+str(newH)
+```
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

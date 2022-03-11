@@ -1,0 +1,437 @@
+---
+title: "lncRNA Networks Investigations"
+author: "Jenny Smith"
+date: "September 5, 2019"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, 
+                      fig.align='center', fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.04.05_Kallisto_DE_Transcriptome_MS/"))
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(DeGSEA)
+library(purrr)
+library(edgeR)
+getwd()
+```
+
+
+#ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.4.19.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI))
+
+head(merged[,1:5])
+dim(merged)
+```
+
+#lncRNA References 
+
+```{r}
+lncRNAs <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+head(lncRNAs)
+dim(lncRNAs)
+
+table(lncRNAs$gene_type)
+```
+
+```{r}
+#https://www.gencodegenes.org/pages/biotypes.html
+IDmap <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno.csv")
+
+
+genes <- IDmap %>% 
+  filter(!gene_id %in% lncRNAs$gene_id) %>% 
+  filter(!gene_type %in% c("miRNA","sRNA","scaRNA","rRNA","snRNA","scRNA",
+                           "vaultRNA","transposable element","snoRNA","misc_RNA")) %>% 
+  filter(!grepl("pseudogene",gene_type))
+
+dim(genes)
+table(genes$gene_type)
+# head(IDmap)
+# dim(IDmap)
+```
+
+```{r}
+survivalLncs <- read.csv("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_Coef_7.17.19.csv")
+
+head(survivalLncs)
+dim(survivalLncs)
+```
+
+#miRNA References
+
+```{r}
+ID.map <- read.csv(file.path(GENREFS,"miRBase_v21/hsa_gff3_IDMap.csv"))
+
+head(ID.map)
+```
+
+```{r}
+mirTarBase <- read_csv(file.path(GENREFS,"miRBase_v21/miRTarBase_v7.0_hsa_MTI.csv"))
+
+head(mirTarBase)
+```
+
+```{r}
+intersect(survivalLncs$gene_name, mirTarBase$`Target Gene`) #0
+```
+
+
+#Raw Counts
+
+```{r}
+RBD <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+rownames(RBD) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD))
+RBD <- RBD[,-grep("Kas|MV4|BM[0-9]|RO[0-9]|MPN[0-9]", colnames(RBD))]
+
+
+head(RBD[,1:5])
+dim(RBD)
+```
+
+```{r}
+miRNA <- read_csv(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_expn_matrix_mimat_miRNA_rawCounts.csv"))
+
+NBM.cells <- miRNA[,grep("Kas|MV4|BM[0-9]|RO[0-9]|MPN[0-9]", colnames(miRNA), value=TRUE)]
+
+miRNA <- miRNA[,-grep("Kas|MV4|BM[0-9]|RO[0-9]|MPN[0-9]", colnames(miRNA))] %>% 
+  separate(mir,c("mir","MIMAT.ID"),sep = "\\.") %>%
+  inner_join(ID.map,., by="MIMAT.ID") %>% 
+  dplyr::select(-MIMAT.ID,-Alias,-mir) %>%
+  column_to_rownames("miR") %>%
+  rename_all(~gsub("(^P.+)-[0-9]{2}A.+","\\1", .))
+
+
+head(miRNA[,1:5])
+dim(miRNA) #2576 1073
+```
+
+
+
+#Normalized Counts
+
+```{r}
+CPM.all <- read_csv("Survival/TARGET_AML_RBD_TMMCPM_forModeling.csv")
+CPM.all <- column_to_rownames(CPM.RNA,"X1") 
+head(CPM.all[,1:5])
+dim(CPM.all)
+```
+
+```{r}
+samples <- intersect(colnames(RBD), colnames(miRNA))
+rnas <- intersect(rownames(RBD),  
+                  c(genes$gene_id,lncRNAs$gene_id))#expressed lncs and genes
+exp.genes <- intersect(rnas,genes$gene_id) #expressed genes
+
+length(exp.genes)
+length(samples)
+```
+
+```{r}
+# https://www.biostars.org/p/317701/ 
+miRNA <- miRNA[,samples]
+RBD <- RBD[rnas,samples]
+
+
+dim(miRNA)
+dim(RBD)
+```
+
+```{r} 
+CPM.RNA <- CPM.RNA[rnas,samples]
+
+keep <- rowSums(cpm(miRNA) >= 1) >= 0.05*ncol(miRNA)
+
+
+miRNA <- miRNA[keep,] 
+TMM.norm <- calcNormFactors(miRNA, method = 'TMM')
+lib.size <- colSums(miRNA)
+CPM.miRNA <- cpm(miRNA, 
+               lib.size = lib.size*TMM.norm,
+               log=TRUE, 
+               prior.count = 0.5)
+
+
+dim(CPM.miRNA) #886 1048
+dim(CPM.RNA) #20599  1048
+```
+
+```{r fig.height=4, fig.width=7}
+par(mfrow=c(1,2))
+hist(as.matrix(CPM.RNA))
+# hist(as.matrix(CPM.lncs))
+hist(as.matrix(CPM.miRNA))
+```
+
+
+
+
+
+#StarBase RNA Networks
+
+```{r}
+library(RCurl)
+```
+
+## miRNA-lncRNA
+
+```{r}
+base_url <- 'http://starbase.sysu.edu.cn/api/miRNATarget/?assembly=hg19'
+
+param.mir.lncs <- paste("geneType=lncRNA", 
+              "miRNA=all",
+              "clipExpNum=3",
+              "degraExpNum=0",
+              "pancancerNum=0",
+              "programNum=2",
+              "program=PITA,RNA22,miRmap,DIANA-microT,miRanda,PicTar,TargetScan",
+              "target=all",
+              "cellType=all", 
+              sep = "&") #capture.output
+
+mir.lncs_url <- paste(base_url, param.mir.lncs, sep="&")
+# mir.lncs_url
+
+type <- c("mirRNA-lncRNA")
+filename <- paste0("StarBase_",type,"_Targets.txt")
+
+mir.lncs <- cat(getURL(mir.lncs_url), 
+           file = filename,
+           sep="")
+
+mir.lncs <- read.delim(file=filename,sep = "\t",header = TRUE,comment.char = "#")
+head(mir.lncs)
+# dim(res) #10605    17
+```
+
+```{r}
+sum(survivalLncs$gene %in% unique(res$geneID))
+sum(survivalLncs$gene_name %in% unique(res$geneName))
+
+mir.lncs.Sig <- mir.lncs %>% 
+  filter(geneID %in% survivalLncs$gene )
+
+
+dim(mir.lncs.Sig)
+# mir.lncs.Sig #AP000553.1
+```
+
+```{r}
+sum(survivalLncs$gene_name %in% unique(mirTarBase$`Target Gene`))
+```
+
+
+## mRNA-lncRNA
+
+```{r}
+base_url <- 'http://starbase.sysu.edu.cn/api/RNARNA/?assembly=hg19'
+
+param.mRNA.lncs <- paste("geneType=lncRNA", 
+              "RNA=all",
+              "interNum=1",
+              "expNum=2",
+              "cellType=all", 
+              sep = "&") #capture.output
+
+mRNA.lncs_url <- paste(base_url, param.mRNA.lncs, sep="&")
+type <- c("mRNA-lncRNA")
+filename <- paste0("StarBase_",type,"_Targets.txt")
+
+mRNA.lncs <- cat(getURL(mRNA.lncs_url), 
+           file = filename,
+           sep="")
+
+mRNA.lncs <- read.delim(file=filename,sep = "\t",header = TRUE,comment.char = "#")
+head(mRNA.lncs)
+dim(mRNA.lncs) #51397    18
+```
+
+```{r}
+mRNA.lncs.Sig <- mRNA.lncs %>% 
+  filter(geneID %in% survivalLncs$gene )
+
+
+dim(mRNA.lncs.Sig)
+```
+
+
+
+## ceRNA 
+
+```{r}
+base_url <- 'http://starbase.sysu.edu.cn/api/ceRNA/?assembly=hg19'
+
+param.ceRNA.lncs <- paste("geneType=lncRNA", 
+              "ceRNA=all",
+              "miRNAnum=2",
+              "family=all",
+              "pval=0.01",
+              "fdr=0.01",
+              sep = "&") #capture.output
+
+ceRNA.lncs_url <- paste(base_url, param.ceRNA.lncs, sep="&")
+type <- c("ceRNA-lncRNA")
+filename <- paste0("StarBase_",type,"_Targets.txt")
+
+ceRNA.lncs <- cat(getURL(ceRNA.lncs_url), 
+           file = filename,
+           sep="")
+
+ceRNA.lncs <- read.delim(file=filename,sep = "\t",header = TRUE,comment.char = "#")
+head(ceRNA.lncs)
+dim(ceRNA.lncs) #84594    11
+```
+
+```{r}
+ceRNA.lncs.Sig <- ceRNA.lncs %>% 
+  filter(geneID %in% survivalLncs$gene) #ceRNAid %in% survivalLncs$gene
+
+dim(ceRNA.lncs.Sig) #No mirna family names???
+length(unique(ceRNA.lncs.Sig$geneName)) #6
+```
+
+
+## RBP-lncRNA
+
+```{r}
+base_url <- 'http://starbase.sysu.edu.cn/api/RBPTarget/?assembly=hg19'
+
+param.RBP.lncs <- paste("geneType=lncRNA", 
+              "RBP=all",
+              "clipExpNum=5",
+              "target=all",
+              "cellType=all",
+              sep = "&") #capture.output
+
+RBP.lncs_url <- paste(base_url, param.RBP.lncs, sep="&")
+type <- c("RBP-lncRNA")
+filename <- paste0("StarBase_",type,"_Targets.txt")
+
+RBP.lncs <- cat(getURL(RBP.lncs_url), 
+           file = filename,
+           sep="")
+
+RBP.lncs <- read.delim(file=filename,sep = "\t",header = TRUE,comment.char = "#")
+head(RBP.lncs)
+dim(RBP.lncs) # 57801    18
+```
+
+```{r}
+RBP.lncs.Sig <- RBP.lncs %>% 
+  filter(geneID %in% survivalLncs$gene) 
+
+dim(RBP.lncs.Sig) #all splicing factors ... so kinda big whoop. 
+unique(RBP.lncs.Sig$geneName)
+```
+
+
+
+#Extract TSS/Genomic Coordinates
+
+```{r}
+# library(GenomicFeatures)
+# library(MultiAssayExperiment)
+# library(SummarizedExperiment)
+# library(DelayedArray)
+# library(HDF5Array)
+```
+
+```{r}
+GTF <- makeTxDbFromGFF(file=file.path(GENREFS,"GRCh38/gtf/gencode.v29.annotation.gtf"),
+                       organism = "Homo sapiens")
+
+GTF
+```
+
+```{r}
+#gets genomic loci for each of  transcripts. 
+txs <- transcriptsBy(GTF, 'gene')
+names(txs) <- gsub("\\.[0-9]{1,2}","", names(txs))
+head(txs)
+```
+
+```{r}
+#Subset for genes of interest
+txs.lncs <- txs[survivalLncs$gene]
+length(txs.lncs)
+
+# subsets the ranges of genomic loci to the first bp of the gene. 
+tss <- resize(txs.lncs,width = 1, fix = 'start') 
+tss
+
+#define the promoter region as -1kbp to +200bp of TSS
+promoter <- promoters(tss, upstream=1000, downstream=200)
+promoter
+
+
+# saveRDS(tss,"TARGET_AML_RBD_SurvivalSignature_lncRNAs_TSS.RDS")
+```
+
+```{r}
+chroms <- tss %>% 
+  sapply(., function(x) as.character(seqnames(x)@values))
+
+
+length(chroms)
+table(chroms) %>% 
+  .[order(.)]
+```
+
+```{r}
+chroms[grep("chr6", chroms)]
+survivalLncs %>% 
+  filter(gene %in% names(chroms[grep("chr6", chroms)])) %>% 
+  arrange(gene_type)
+```
+
+
+
+#DNA Methylation Differences 
+
+```{r}
+MAE <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_MAE_T.Triche.rds"))
+
+MAE
+```
+
+```{r}
+assay(MAE)
+```
+
+
+```{r}
+assays(MAE)
+```
+
+```{r}
+assay(MAE@ExperimentList$CNA)
+```
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

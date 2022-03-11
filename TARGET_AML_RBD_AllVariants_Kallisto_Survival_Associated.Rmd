@@ -1,0 +1,3034 @@
+---
+title: 'Surivival Analysis of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 16, 2019"
+output: html_document
+---
+
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE, fig.align='center', fig.height=5,
+                      fig.width=8, dpi = 600)
+
+options(stringsAsFactors = FALSE)
+options(expressions = 500000)
+
+options(stringsAsFactors = FALSE,bitmapType = 'cairo')
+# grDevices::X11.options(type='cairo')
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(readr)
+library(DeGSEA) #my custom build R package that used to be imported through `source` 
+# library(pheatmap)
+library(RColorBrewer)
+library(edgeR)
+library(survival)
+# library(gtools)
+library(gridExtra)
+library(GGally)
+library(DeGSEA)
+
+
+getwd()
+```
+
+```{r}
+# source(file.path(SCRIPTS, "survival_analysis/Survplot_Functions_2018.10.24.r"))
+```
+
+
+# Define Functions
+
+```{r}
+rmDups <- function(count.matrix, ID.map, matrix.class=TRUE,rowname.GeneSym=TRUE){
+  
+  df <- count.matrix %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    left_join(., ID.map, by=c("gene_id")) %>% 
+    select(gene_id, gene_name, everything()) %>%
+    filter(!grepl("_PAR_", gene_id)) #specific to gencode refs
+  
+  
+  dup <- df$gene_name[which(duplicated(df$gene_name))]
+  ddf <- df %>%
+    filter(gene_name %in% dup) %>% 
+    arrange(gene_name)%>% 
+    mutate(Variance=genefilter::rowVars(select(., -gene_id, -gene_name))) %>%
+
+    group_by(gene_name) %>% 
+    mutate(High.Variance=Variance==max(Variance)) %>% 
+    ungroup() %>% 
+    
+    filter(High.Variance)  %>%
+    filter(!duplicated(gene_name))#if variance tied, pick first one
+    
+  
+  if(rowname.GeneSym){
+    rmDups.df <- df %>% 
+        filter(! gene_name %in% dup) %>% 
+        bind_rows(.,ddf) %>%
+        select(everything(),-gene_id, -Variance,-High.Variance) %>%
+        column_to_rownames("gene_name")
+  }else{
+    rmDups.df <- df %>% 
+        filter(! gene_name %in% dup) %>% 
+        bind_rows(.,ddf) %>%
+        select(everything(),-gene_name, -Variance,-High.Variance) %>%
+        mutate(gene_id=gsub("\\.[0-9]{1,2}", "", gene_id)) %>% 
+        column_to_rownames("gene_id")
+  }
+
+  if(matrix.class){
+    rmDups.df <- data.matrix(rmDups.df)
+  }
+  
+  return(rmDups.df)
+}  
+```
+
+```{r}
+cox_reg <- function(gene_name,CDE,variables=NULL, OS=FALSE){
+  
+  if(OS){
+    KM <- Surv(time=CDE$OS.time..days., event = CDE$OS.ID)
+  }else{
+     KM <- Surv(time=CDE$EFS.time..days., event = CDE$Event.ID)
+  }
+ 
+  
+  if(is.null(variables)){
+    variables <- gene_name
+  }else{
+    variables <- paste(c(gene_name,variables),collapse = "+")
+  }
+  
+  formula <- as.formula(paste("KM",variables, sep=" ~ ")) 
+
+  c1 <- coxph(formula, data=CDE)
+  tab <- coxSummaryTable(c1)
+  
+  return(tab)
+}
+```
+
+```{r}
+plots <- function(Model.Comparison.df, Gene.Col,log=FALSE, type="wfall"){
+  library(ggpubr)
+  if(!log){Model.Comparison.df[,Gene.Col] <- 2^(Model.Comparison.df[,Gene.Col]-1)} #non-log2
+  
+  if(type=="wfall"){
+   p <- ggbarplot(Model.Comparison.df, 
+            x = "USI", y = Gene.Col,
+          fill = "lnc.Percentile.Groups",               # change fill color by cyl
+          color = "lnc.Percentile.Groups",            # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          sort.val = "asc",           # Sort the value in dscending order
+          sort.by.groups = FALSE,      # Sort inside each group
+          x.text.angle = 90,           # Rotate vertically x axis texts
+          facet.by = "Set",
+          scales="free") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  if(type=="box"){
+   p <- ggboxplot(Model.Comparison.df, 
+          x = "lnc.Percentile.Groups", y = Gene.Col, 
+          fill = "lnc.Percentile.Groups",               
+          palette = "jco",            
+          sort.val = "asc",           
+          sort.by.groups = FALSE,      
+          x.text.angle = 90,           
+          facet.by = "Set",
+          scales="fixed") + 
+    theme(axis.text.x=element_blank())
+  }
+  
+  return(p)
+}
+```
+
+```{r}
+cox_glmnet_workflow <- function(CDE.train,targets,
+                                IDmap,sig.mres,
+                                std=FALSE,N.Groups=5,oneSE=FALSE,
+                                CDE.test,
+                                CDE.validation=NULL,
+                                CDE.validation2=NULL){
+  
+  suppressPackageStartupMessages(library(glmnet))
+  #CDE.train has  patients as rows, surivival data and all genes expression values as columns.
+  #targets is a character vector with the column names of the genes of interest that will be included in the glmnet fit. 
+  #lncRNAs is IDmap for ENSG lncRNA IDs to gene name with biotype. 
+  #sig.mres is the signifant multivariable coxph EFS = lncRNA_A + Age + Blasts + WBC.at.Diagnosis + Final.Risk.Group
+  #CDE.test has  patients as rows, surivival data and all genes expression values as columns.
+  #CDE.validation has  patients as rows, surivival data and all genes expression values as columns.
+      
+      
+      sparsemat_to_df <- function(coef){
+        #sparsemat is a sparce matrix from the output of predict(.,type="coefficients")
+        coef <- data.frame(coef=coef[,1]) %>%
+          rownames_to_column("gene") %>%
+          filter_all(all_vars(. != 0))
+        return(coef)
+      }
+      
+      #Derive the AIC for model 
+      #https://stats.stackexchange.com/questions/25817/is-it-possible-to-calculate-aic-and-bic-for-lasso-regression-models
+      AIC.stat <- function(fit,lambda.val){
+        idx <- which(fit$lambda == lambda.val) #select which model to get AIC from
+        tLL <- fit$nulldev - deviance(fit)[idx]
+        k <- fit$df[idx]
+        n <- fit$nobs
+        AICc <- -tLL+2*k+2*k*(k+1)/(n-k-1)
+        return(AICc)
+        # BIC <- log(n)*k - tLL
+      }
+
+      
+      #character vector of input data sets
+      sets <- c("Train","Test")
+      addl <- c(!is.null(CDE.validation), !is.null(CDE.validation2))
+      if(all(addl)){sets <- c(sets,"Validation","Validation2")
+      }else if(addl[1]){sets <- c(sets,"Validation")}
+      
+      #grid of lambda values to test.
+      grid <- 10^ seq(10,-2, length=100)
+      
+      
+      ## Training 
+      x.train <- CDE.train %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(targets) %>%  #pull(sig.ures,Variable)
+        as.matrix()
+      
+      y.train <- CDE.train %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(time="EFS.time..days.", status="Event.ID") %>%
+        as.matrix()
+      
+      # dim(y.train)
+      # dim(x.train)
+      
+      mod <- glmnet(x=x.train,
+                    y=y.train,
+                    family = "cox",
+                    standardize = std,
+                    lambda = grid)
+      
+      # plot(mod)
+      
+      #Seed was set at 2019 
+      set.seed(2019)
+      cv.lambda <- cv.glmnet(x=x.train, y=y.train,
+                             family = "cox",
+                             standardize = std,
+                             lambda = grid,
+                             nfolds = nrow(x.train),
+                             type.measure = "deviance")
+      
+      if(oneSE){
+        lambda <- cv.lambda$lambda.1se
+      }else{
+        lambda <- cv.lambda$lambda.min
+      }
+      
+    
+      coef.trainingMod <- predict(mod, type="coefficients", s=lambda)
+      nonZero.train <- sparsemat_to_df(coef.trainingMod) %>% 
+        arrange(desc(coef)) %>% 
+        left_join(., IDmap, by=c("gene"="gene_id")) %>% 
+        left_join(., select(sig.mres, Variable, Hazard.Ratio, P.Value),
+                  by=c("gene"="Variable"))
+      
+      ## Testing 
+      x.test <- CDE.test %>% 
+        filter(EFS.time..days. != 0) %>% # time cannot be zero 
+        select(targets) %>% 
+        as.matrix()
+
+      
+      #predict the surival outcome. Returns relative risk of each patient
+      pred.outcome <- predict(mod, 
+                              newx = x.test,
+                              type="response",
+                              s=lambda) 
+  
+      #Model AIC 
+      AIC <- AIC.stat(fit = cv.lambda$glmnet.fit, lambda.val=lambda)
+      
+      
+      ##Apply the Score 
+      rm.genes <- setdiff(grep("^ENSG", colnames(CDE.train), value=TRUE),
+                          nonZero.train$gene) #genes NOT selected in Model
+      Model.Comparison.df <- CDE.train %>% 
+        bind_rows(CDE.test,CDE.validation,CDE.validation2) %>%
+        select(USI,Set,everything(),-rm.genes) %>%  
+        select(USI,Set,nonZero.train$gene,everything()) %>% #ensure CORRECT ORDER of gene expression columns 
+        mutate(lnc.Score=apply(dplyr::select(., starts_with("ENSG")), 1,
+                               function(x) sum(x*nonZero.train$coef)))#apply the score calculation 
+      
+      #Exception handling if score ends up having very low variability.
+      N=N.Groups
+      perc.labs <- function(N){paste0("q",1:N)}
+      e <- try(group_by(Model.Comparison.df, Set) %>% 
+                  mutate(TEST=quantcut(lnc.Score, q=N, na.rm=FALSE, labels=perc.labs(N))), 
+               silent = TRUE)
+      if(inherits(e,"try-error")){N=3}
+    
+      
+      #Create Median/Percentile Groups
+      Model.Comparison.df <- Model.Comparison.df %>%
+        group_by(Set) %>% 
+        mutate(lnc.Median.Groups=factor(ifelse(lnc.Score >= median(lnc.Score), "high", "low"),
+                                        levels=c("low", "high")), 
+               lnc.Percentile.Groups=as.factor(quantcut(lnc.Score, q=N, na.rm=FALSE, 
+                                                        labels=perc.labs(N)))) %>%
+        arrange(desc(lnc.Score)) %>%
+        ungroup() %>% 
+        mutate(Set=factor(Set, levels = sets))
+        
+      
+      
+      #Model formulas
+      y1 <- c("OS.time..days.","OS.ID")
+      y2 <- c("EFS.time..days.","Event.ID")
+      make_form <- function(response,covariate){ 
+        as.formula(paste0("Surv(", response[1],"/365.25", ",",response[2], ")~ ",covariate))
+      }
+      
+      #Examine how the model score delineates risk groups.
+      error.metrics <- Model.Comparison.df %>%
+        group_by(Set) %>%
+        do(cox.OSmedianGroups=coxph(make_form(y1, "lnc.Median.Groups"), data = .),
+           cox.EFSmedianGroups=coxph(make_form(y2, "lnc.Median.Groups"), data = .),
+           
+           cox.OSpercentileGroups=coxph(make_form(y1, "lnc.Percentile.Groups"), data = .),
+           cox.EFSpercentileGroups=coxph(make_form(y2, "lnc.Percentile.Groups"), data = .),
+           
+           
+           cox.OScontinuous=coxph(make_form(y1, "lnc.Score"), data = .),
+           cox.EFScontinuous=coxph(make_form(y2, "lnc.Score"), data = .),
+           
+           KM.OS.Med=SurvivalPlot(survfit(make_form(y1, "lnc.Median.Groups"), data=.), #survival plots
+                              LegendTitle = "OS",
+                              timeUnit = "Years",
+                              colors = c("high"="red", "low"="dodgerblue")),
+           KM.EFS.Med=SurvivalPlot(survfit(make_form(y2, "lnc.Median.Groups"), data=.),
+                               LegendTitle="EFS",
+                               timeUnit= "Years",
+                               colors= c("high"="red", "low"="dodgerblue")), 
+           
+           KM.OS.Perc=SurvivalPlot(survfit(make_form(y1, "lnc.Percentile.Groups"), data=.), #survival plots
+                              LegendTitle = "OS",
+                              timeUnit = "Years",
+                              colors = "gg.def"),
+           KM.EFS.Perc=SurvivalPlot(survfit(make_form(y2, "lnc.Percentile.Groups"), data=.),
+                               LegendTitle="EFS",
+                               timeUnit= "Years",
+                               colors= "gg.def")) %>% 
+        ungroup() %>% 
+        mutate(Set=factor(Set, levels=sets)) %>% 
+        arrange(Set)
+  
+  #Final results 
+  res <- list(mod,cv.lambda,nonZero.train,Model.Comparison.df,error.metrics,AIC)  
+  names(res) <- c("training.model","cv.lambda","nonZero.train.coef","Model.Comparison.df","error.metrics","AIC")
+  
+  return(res)    
+}
+
+
+#Collapse the error metrics tibble into a dataframe
+extract_metrics_df <- function(error.metrics.tibble,V=FALSE, V2=FALSE){
+  Names <- names(error.metrics.tibble[2:7])
+  sets <- c("Train","Test")
+  
+  addl <- c(V, V2)
+  if(all(addl)){sets <- c(sets,"Validation","Validation2")
+  }else if(addl[1]){sets <- c(sets,"Validation")}
+  
+  N <- length(sets)
+  
+  res <- lapply(Names, 
+       function(x) lapply(error.metrics.tibble[[x]], coxSummaryTable) %>% 
+         lapply(., function(x) mutate(x,Levels=nrow(x))) %>%
+         bind_rows() %>% 
+         mutate(Comparison=x,Set=rep(sets, each=unique(Levels)))) %>% 
+  bind_rows() %>% 
+  select(Comparison, Set, everything())
+  
+  return(res)
+}
+
+```
+
+```{r}
+xtile <- function(names,exp_vals,sdfp,survival_type){
+  require('dplyr')
+  #names = patient names
+  #exp_vals = expression levels of that gene for each patient listed in names
+  #sdfp = survival data (Event and Time to Event) for each patient listed in names
+  #survival_type = "OS" or "EFS"
+  names(exp_vals) = as.character(names)
+  exp_vals_sorted = sort(exp_vals)
+  sdfp = sdfp[names(exp_vals_sorted),]
+  best_p_val = 1
+  best_i = 1
+  p_values = c()
+  for(i in floor(length(exp_vals_sorted)*0.1):(ceiling(length(exp_vals_sorted)*0.9))){
+    c_clusters = c(rep("A",i),rep("B",(length(exp_vals_sorted)-i)))
+    if(survival_type=="OS"){
+      sd = survdiff(Surv(OS_time_years, OS_event_ID==1 ) ~ c_clusters, data=sdfp)
+      coxvar = try(coxph(formula = Surv(OS_time_years, OS_event_ID==1 ) ~ c_clusters, data = sdfp))
+    }
+    if(survival_type=="EFS"){
+      sd = survdiff(Surv(EFS_time_years, EFS_event_type_ID==1 ) ~ c_clusters, data=sdfp)
+      coxvar = try(coxph(formula = Surv(EFS_time_years, EFS_event_type_ID==1 ) ~ c_clusters, data = sdfp))
+    }
+    p_values = c(p_values,summary(coxvar)$coefficient[5])
+    p_val = 1 - pchisq(sd$chisq, 1)
+    if(as.numeric(p_val)<as.numeric(best_p_val)){
+      best_i = i
+      best_p_val = p_val
+    }
+  }
+  
+  GROUPA = names(exp_vals_sorted[1:best_i])
+  GROUPB = names(exp_vals_sorted[(best_i+1):length(exp_vals_sorted)])
+  groupings = ifelse(names%in%GROUPA,"Low","High")
+  cut_point = mean(exp_vals_sorted[best_i:(best_i+1)])
+  r_data = list(groupings,cut_point)
+  names(r_data) = c("Groupings","Cut_Point")
+  return(r_data)
+}
+```
+
+
+# Read in the Clinical Data
+
+```{r}
+cols_for_supp <- read.csv(file.path(substr(CDE,1,nchar(CDE)-3), "metadata/TARGET_AML_Clinical_Columns_for_Analysis_7.24.20.csv"))
+
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                   row.names = 1, na.strings = c("N/A","NA","#N/A","^\\.$", "^$"))
+
+
+merged <- merged %>%
+  filter(!is.na(USI), !grepl("Unknown", USI)) %>%
+  filter(!is.na(EFS.time..days.)) %>%
+  set_rownames(.$USI)
+
+head(merged[,1:5])
+dim(merged) #2181  149
+```
+
+```{r eval=TRUE}
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_Ribodepleted_Manifest_02.04.21.csv"), 
+                     row.names = 1) %>% 
+  group_by(Group, USI) %>% 
+  mutate(dx_rlps_pair=case_when(
+    sum(grepl("relapse", Time_point)) >= 1 & 
+      sum(grepl("diagnostic",Time_point)) >= 1 ~ "dx_rlps_pair",
+    TRUE ~ Group))
+
+head(manifest)
+# table(manifest$dx_rlps_pair) #849 pairs? 
+```
+
+
+# Read in the counts
+
+```{r eval=FALSE}
+RBD <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+rownames(RBD) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD))
+
+head(RBD[,1:5])
+dim(RBD) #59853  1462
+```
+
+```{r eval=FALSE}
+polyA <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_polyA_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+rownames(polyA) <- gsub("\\.[0-9]{1,}$", "", rownames(polyA))
+polyA <- polyA[,setdiff(colnames(polyA), colnames(RBD))] #no duplicates
+polyA <- polyA[,intersect(colnames(polyA), merged$USI)] #requires EFS/OS data
+
+# head(polyA[,1:5])
+dim(polyA) #59853   315
+```
+
+
+# Read in the Gene Annotations
+
+```{r}
+IDmap <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_12.23.19.csv"))
+
+head(IDmap)
+dim(IDmap)
+```
+
+```{r}
+lncRNAs <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv"), row.names = 1) %>% 
+  set_rownames(.$gene_id)
+
+# head(lncRNAs)
+dim(lncRNAs)
+```
+
+```{r}
+LSC17 <- read.csv(file.path(PROJHOME,"2017.02.28_LSC17_Score/LSC17_Genes_Coeff.csv")) %>% 
+  mutate(LSC_alias=case_when(
+    LSC_genes =="KIAA0125" ~ "FAM30A", 
+    LSC_genes == "NGFRAP1" ~ "BEX3", 
+    LSC_genes == "GPR56" ~ "ADGRG1", 
+    TRUE ~ LSC_alias)) %>% 
+  left_join(., select(IDmap,gene_id, gene_name),
+            by=c("LSC_genes"="gene_name")) %>% 
+  left_join(., select(IDmap,gene_id, gene_name),
+            by=c("LSC_alias"="gene_name")) %>% 
+  mutate(gene_id=ifelse(is.na(gene_id.x), gene_id.y, gene_id.x)) %>% 
+  select(-matches("\\.x|\\.y"))
+  # filter(is.na(gene_id))
+
+# LSC17
+# write.csv(LSC17,"~/RNA_seq_Analysis/2017.02.28_LSC17_Score/LSC17_Genes_Coeff_update.csv")
+```
+
+Alias: 
+
+FAM30A == KIAA0125
+BEX3 == NGFRAP1
+ADGRG1== GPR56
+
+
+# Combine CDE 0531 and 1031
+
+```{r warning=FALSE}
+CDE.survdat <- read.csv("Survival/00_Archive/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_CDE_8.02.19.csv") %>%
+  select(USI,matches("^ENSG|LSC17.Score|LSC\\.|lnc\\.|Set|log10.WBC")) %>%
+  left_join(.,select(merged,USI,
+                     ISCN,
+                     Eligibility,Eligibility_Comments,
+                     Primary.CNV,
+                     Primary.Fusion,
+                     Additional.Fusions.CNV,
+                     ETS_Fusion,
+                     FLT3.ITD.allelic.ratio,
+                     Cyto.Fusion.Molecular.Risk_update,
+                     everything()),
+            by="USI")  %>% 
+  #Fix the final.risk.group 
+  mutate_at(vars(Final.Risk.Group),~case_when(
+    Cyto.Fusion.Molecular.Risk_update=="Standard" & MRD.at.end.of.course.1=="Unknown" ~ "Unknown",
+    TRUE ~ .
+  )) %>% 
+  #Jason wants this patient to remain High due to not beign in CR1 despite it not fitting the definition we laid out
+  mutate_at(vars(Final.Risk.Group),~case_when(
+    USI=="PAWAIG" ~ "High",
+    TRUE ~ .  )) %>% 
+  
+    #Create an integrated risk group with lncRNA and cyto/mol
+    mutate(lncRNA_plus_CM_Risk=factor(case_when(
+              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "High" ~ "Standard",
+              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ "Low",
+              TRUE ~ Cyto.Fusion.Molecular.Risk_update), 
+      levels = c("Standard","High", "Low"))) %>% 
+    
+    mutate(lncRNA_plus_CM_Risk_basedonEFS=factor(case_when(
+              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "High" ~ "Standard",
+              lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ "High",
+              TRUE ~ Cyto.Fusion.Molecular.Risk_update), 
+      levels = c("Standard","High", "Low"))) %>% 
+  
+    mutate(lncRNA_plus_CM_Risk_2Groups=factor(case_when(
+              lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Low" ~ "Neg",
+              TRUE ~ lnc.Pos.Neg), 
+      levels = c("Neg","Pos"))) %>% 
+  
+    mutate(Cyto.Fusion.Molecular.Risk_update = factor(Cyto.Fusion.Molecular.Risk_update, 
+                                              levels=c("Standard","High","Low")))
+
+
+#Set factor levels and fix error  
+CDE.survdat <- CDE.survdat %>%
+  
+  mutate_at(vars(Set), 
+            ~factor(gsub("Test","Validation1",gsub("^Validation$","Validation2", .)),
+                    levels=c("Train","Validation1","Validation2"))) %>% 
+  mutate_at(vars(Cyto.Fusion.Molecular.Risk_update),
+            ~factor(., levels=c("High","Standard","Low"))) %>%
+  mutate_at(vars(matches("LSC\\.[Mq]")),~factor(.,levels=c("low","high"))) %>%
+  mutate_at(vars(matches("LSC\\.Perc")),~factor(.,levels=c("q1","q2",
+                                                           "q3","q4"))) %>%
+  mutate_at(vars(matches("lnc.Pos")), ~factor(., levels=c("Neg","Pos"))) %>% 
+  mutate_at(vars(matches("lnc.Med")), ~factor(.,levels=c("low","high"))) %>%
+  mutate_at(vars(matches("lnc\\.Perc")),~factor(.,levels=c("q1","q2",
+                                                           "q3","q4"))) %>%
+  #this has not been explicitly updated yet 7/24/20 even though Final.Risk.Group has been 
+  mutate_at(vars(lncRNA_plus_CM_Risk),
+            ~factor(., levels=c("Standard","Low","High"))) %>%
+  
+  #Need to re-run this b/c NPM1/CEBPA was swapped
+  mutate(Sequencing_Cohort="RBS", #ORIGINAL CODE for blocked randomization
+         AML="AML",
+         Major.Group_update=case_when(
+                      grepl("CBFA2T3-GLIS2",Primary.Fusion) ~ "CBFA2T3-GLIS2",
+                      grepl("NUP98-NSD1|NSD1-NUP98",Primary.Fusion) ~ "NUP98-NSD1",
+                      grepl("NUP98-KDM5A|KDM5A-NUP98",Primary.Fusion) ~ "NUP98-KDM5A",
+                      grepl("DEK-NUP214", Primary.Fusion) ~ "DEK-NUP214",
+
+                      grepl("RBM15-MKL1",Primary.Fusion) ~ "RBM15-MKL1",
+                      grepl("RUNX1-CBFA2T3",Primary.Fusion) ~ "RUNX1-CBFA2T3", 
+                      grepl("NPM1-MLF1",Primary.Fusion) ~ "NPM1-MLF1", 
+                      
+                      grepl("RUNX1-RUNX1T1", Primary.Fusion) ~ "RUNX1-RUNX1T1",
+                      grepl("CBFB-MYH11", Primary.Fusion) ~ "CBFB-MYH11",
+                      grepl("KMT2A-|-KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV)  ~ "KMT2A",
+
+                      grepl("NUP98",Primary.Fusion) &
+                        !grepl("NUP98-KDM5A|NUP98-NSD1",Primary.Fusion)~ "NUP98-Other",
+                      grepl("MLLT10", Primary.Fusion) & !grepl("KMT2A", Additional.Fusions.CNV) ~ "MLLT10",
+                      grepl("KAT6A", Primary.Fusion) | grepl("KAT6A", Additional.Fusions.CNV) |
+                         grepl("t\\(8;16\\)\\(p11.2;p13.3\\)", ISCN) ~ "KAT6A",
+                      grepl("ETV6", ETS_Fusion) ~ "ETS-ETV6",
+                      grepl("ETS-Other|FUS-ERG", ETS_Fusion) ~ "ETS-Other",
+                    
+
+                      grepl("monosomy7", Primary.CNV)  ~ "monosomy7",
+                      # grepl("del5q", Primary.CNV) ~ "del5q", #only 5 patients, so a little confusing
+                      FLT3.ITD.allelic.ratio > 0.1 ~ "FLT3.ITD",
+                      NPM.mutation. == "Yes" ~ "NPM1",
+                      CEBPA.mutation. == "Yes" ~ "CEBPA",
+                      TRUE ~ "OtherAML")) %>%
+  
+  filter(Eligibility_Comments!= "remove") %>%
+  set_rownames(.$USI) 
+
+
+
+head(CDE.survdat[,1:5])
+dim(CDE.survdat) #1298  223
+
+# write.csv(CDE.survdat, "TARGET_AML_lncRNA_CDEs_09.14.21.csv", row.names = FALSE)
+```
+
+```{r}
+# table(CDE.survdat$ETS_Fusion, useNA='ifany')
+# table(CDE.survdat$Primary.CNV, useNA = 'ifany')
+
+#No real issues with eligibility! whoo!
+CDE.survdat %>% 
+  group_by(Set,Eligibility_Comments) %>%
+  summarise(N=n()) %>% 
+  ungroup() #%>% 
+  # write.csv(., "TARGET_AML_lncRNA_Eligability.csv", row.names = F)
+
+# table(CDE.survdat$Eligibility_Comments) # 2 must be removed 
+# filter(CDE.survdat, Eligibility_Comments=="remove") %>% 
+#   select(USI,Reg., Set, Eligibility, Eligibility_Comments)
+# table(CDE.survdat$Major.Group_update, useNA='ifany')
+# table(CDE.survdat$lncRNA_plus_CM_Risk_basedonEFS)
+
+CDE.survdat %>% 
+  filter(SCT.in.1st.CR != "Unknown") %>% 
+  group_by(Cyto.Fusion.Molecular.Risk_update, SCT.in.1st.CR) %>% 
+  summarise(N=n())
+
+
+CDE.survdat %>% 
+  filter(SCT.in.1st.CR != "Unknown") %>% 
+  group_by(lncRNA_plus_CM_Risk_basedonEFS, SCT.in.1st.CR) %>% 
+  summarise(N=n())
+
+
+CDE.survdat %>% 
+  filter(SCT.in.1st.CR != "Unknown", Cyto.Fusion.Molecular.Risk_update != "Low") %>% 
+  group_by(lnc.Pos.Neg,Cyto.Fusion.Molecular.Risk_update, SCT.in.1st.CR) %>% 
+  summarise(N=n())
+
+```
+
+
+## Supplemental Data for Manuscript
+
+```{r}
+# date="12.11.20"
+date="09.13.21"
+```
+
+```{r}
+Expn_Data_Supp <- CDE.survdat %>% 
+  select(USI,Set,lnc.Pos.Neg,lnc.Score, matches("ENSG")) %>% 
+  select(-all_of(LSC17$gene_id))
+
+
+head(Expn_Data_Supp)
+dim(Expn_Data_Supp) 
+# write.csv(Expn_Data_Supp,
+#           paste0("manuscript/Supplemental_Tables/TARGET_AML_Expn_Data_Supplement",date,".csv"),
+#                  row.names = FALSE)
+```
+
+```{r warning=FALSE}
+CDE_Data_Supp <- CDE.survdat %>% 
+  select(-matches("^ENSG")) %>% 
+  # left_join(., JEFedited, by="USI") %>%
+  arrange(Set) %>%
+  mutate(Major.Group=Major.Group_update,
+         `Cyto/Fusion/Molecular Risk update`=Cyto.Fusion.Molecular.Risk_update) %>% 
+  mutate_all(~as.character(.)) %>% 
+  select(USI,
+         Study=Protocol,
+         Set,
+         `lncScore Group`=lnc.Pos.Neg, 
+         `LSC17 Group`=LSC.Med.Groups_AllPts,
+         `Integrated lncScore CMrisk`=lncRNA_plus_CM_Risk,
+         `Major Group (for stratified randomization)`=Major.Group,
+         `Primary Fusion`=Primary.Fusion,
+         `Primary CNV`=Primary.CNV,
+         `Additional CNV or Fusion`=Additional.Fusions.CNV,
+         # `Cyto vs. Seq`=Cyto.vs..Seq,
+         `Cyto/Fusion/Molecular Risk update`,
+         `Final Risk Group Update`=Final.Risk.Group, 
+         `EFS time (days)`=EFS.time..days.,
+         `OS time (days)`=OS.time..days.,
+         `EFS event type ID`=EFS.event.type.ID,
+         `OS event ID`=OS.event.ID)
+         # `RAM Positive`=RAM.phenotype, 
+          # ISCN)
+
+         # one_of(cols_for_supp$x),
+         # EFS.time..days.,
+         # OS.time..days.,
+         # -Primary.Cytogenetic.Code)
+
+
+head(CDE_Data_Supp)
+dim(CDE_Data_Supp) #1300   56
+
+# xlsx::write.xlsx(CDE_Data_Supp, "manuscript/COG_Requests/TARGET_AML_lncScore_Manuscript_Meshinchi_09.13.21.xlsx")
+# write.csv(CDE_Data_Supp,
+#           paste0("manuscript/Supplemental_Tables/TARGET_AML_CDE_Supplement",date,".csv"),
+#           row.names = F)
+```
+
+```{r}
+if(! any(grepl("Set",colnames(CDE.survdat)) )) {
+  library(randomizr)
+  set.seed(2019)
+  
+  b <- paste(CDE.survdat$Final.Risk.Group, CDE.survdat$Treatment.Arm, CDE.survdat$Major.Group, sep=": ")
+  blocks <- block_ra(blocks = b, 
+                   prob_each = c(0.6,0.2,0.2), 
+                   num_arms=3, 
+                   conditions = c("Train","Test","Validation"))
+  
+  CDE.survdat <- CDE.survdat %>%
+    mutate(Set=blocks) %>%
+    mutate(Set=factor(Set, levels=c("Train","Test","Validation")))
+
+}
+
+table(CDE.survdat$Set)
+```
+
+```{r}
+CDE.survdat %>% 
+  group_by(Set) %>% 
+  mutate(N=n()) %>% 
+  group_by(Cyto.Fusion.Molecular.Risk_update, .add=TRUE) %>% 
+  summarize(N_RG=n(),
+            Percent=round(N_RG/N[1]*100, digits = 1)) %>% 
+  ungroup() %>% 
+  select(-N_RG) %>%
+  spread(Set, Percent) %>% 
+  rename_at(vars(1), ~gsub("Cyt.+lar.","Cytomolecular ",.)) %>%
+  rename_at(vars(2:4), ~paste(.,"Set")) %>%
+  mutate_at(vars(1), ~paste(.,"Risk")) #%>% 
+  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_Risk.Group_SuppTable_", date, ".csv"), row.names = F)
+```
+
+```{r}
+CDE.survdat %>% 
+  group_by(Set) %>% 
+  mutate(N=n()) %>% 
+  group_by(Protocol, add=TRUE) %>% 
+  summarize(N_PG=n(),
+            Percent=round(N_PG/N[1]*100, digits = 1)) %>% 
+  ungroup() %>% 
+  select(-N_PG)%>%
+  spread(Set, Percent) %>%
+  mutate(Protocol=factor(Protocol,
+                         levels=c("CCG-2961","AAML03P1",
+                                  "AAML0531","AAML1031"))) %>%
+  rename_at(vars(2:4), ~paste(.,"Set")) #%>%
+  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_Protocol_SuppTable_", date, ".csv"), row.names = F)
+
+
+```
+
+```{r}
+# table(CDE.survdat$Set, CDE.survdat$Treatment.Arm)
+Fusion.Group.Frequencies <- CDE.survdat %>% 
+  group_by(Set) %>% 
+  mutate(N=n()) %>% 
+  group_by(Major.Group_update, add=TRUE) %>% 
+  summarize(N_MG=n(),
+            Percent=round(N_MG/N[1]*100, digits = 1)) %>% 
+  ungroup() %>% 
+  select(-N_MG) %>%
+  spread(Set, Percent) %>% 
+  rename_at(vars(Train:Validation2), ~paste(., "Set")) %>%
+  arrange(desc(`Train Set`)) #%>% 
+  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_FusionGroup__SuppTable_", date, ".csv"), row.names = F)
+
+
+head(Fusion.Group.Frequencies)
+dim(Fusion.Group.Frequencies)
+```
+
+
+## Train/Test/Val Subset Dataframes
+
+```{r}
+CDE.train <- CDE.survdat[CDE.survdat$Set == "Train",]
+
+table(CDE.train$Final.Risk.Group)
+table(CDE.train$Treatment.Arm)
+```
+
+```{r}
+CDE.test <- CDE.survdat[CDE.survdat$Set == "Test",]
+
+table(CDE.test$Final.Risk.Group)
+table(CDE.test$Treatment.Arm)
+```
+
+```{r}
+CDE.validation <- CDE.survdat[CDE.survdat$Set == "Validation",]
+  
+table(CDE.validation$Final.Risk.Group)
+table(CDE.validation$Treatment.Arm)
+```
+
+```{r}
+CDE.validation2 <- CDE.0531.subset[CDE.0531.subset$Sequencing_Cohort == "PolyA",]
+CDE.validation2$Set <- "Validation2"
+```
+
+
+# DE with AML vs NBM in training set
+
+```{r}
+NBM.cols <- colnames(RBD) %>% grep("^BM|^RO",., value = TRUE)
+train.cols <- c(NBM.cols, CDE.train$USI)
+p <- c(rep("NBM", length(NBM.cols)),
+       rep("AML", nrow(CDE.train))) %>% 
+  set_names(train.cols)
+
+DE <- voom_DE(expnData = RBD[,train.cols],
+              pheno = p,
+              percent=0.01, #1%
+              ref =  "NBM",
+              GOI=lncRNAs$gene_id)
+
+# DE.all <- voom_DE(expnData = RBD[,train.cols],
+#               pheno = p,
+#               percent=0.01, #1%
+#               ref =  "NBM",
+#               GOI=NULL)
+
+dim(DE$Voom$E)
+dim(DE$DE) #1346    6
+# table(rownames(DE$Voom$E) %in% lncRNAs$gene_id)
+```
+
+```{r}
+# dim(DE.all$DE) #6,664
+# sum(rownames(all_DE_lncRNAs) %in% rownames(DE.all$DE))
+# write.csv(DE.all$DE %>% 
+#             rownames_to_column("gene_id") %>% 
+#             left_join(., IDmap, by="gene_id") %>%
+#             select(gene_id,gene_name,everything()),
+#   "Survival/TraingSet_AMLvsNBM_DE_lncRNA_mRNAs.csv" )
+# head(all_DE_lncRNAs)
+
+DE$DE <- DE$DE %>% 
+  rownames_to_column("gene_id") %>% 
+  right_join(., lncRNAs, by="gene_id") %>% 
+  filter(adj.P.Val < 0.05, abs(logFC) > 1.0) %>%
+  arrange(desc(logFC))
+
+
+head(DE$DE)
+# sum(DE$DE$adj.P.Val < 0.05)
+# sum(abs(DE$DE$logFC) > 1.0)
+# write.csv(DE$DE,"Survival/TraingSet_AMLvsNBM_DEGs.csv", row.names = FALSE)
+```
+
+```{r}
+DE <- list()
+DE$DE <- read.csv("Survival/TraingSet_AMLvsNBM_DEGs.csv")
+table(DE$DE$logFC > 1) #647 upreg
+```
+
+# Update CDEs with Expression Values
+
+The TMM method implements the trimmed mean of M-values proposed by Robinson and Oshlack (2010). By default, the M-values are weighted according to inverse variances, as computed by the delta method for logarithms of binomial random variables. If refColumn is unspecified, then the library whose upper quartile is closest to the mean upper quartile is used.
+
+```{r}
+# https://www.biostars.org/p/317701/ 
+#start with the expressed genes from the training set that removed "low count genes" before normalization
+#followed by removal of very low count genes across the full dataset again
+genes <- unique(c(rownames(DE$Voom$E))) 
+
+keep <- genes[rowSums(cpm(RBD[genes,]) >= 1) >= 0.05*ncol(RBD)]
+
+RBD.lnc <- RBD[keep,] 
+TMM.norm <- calcNormFactors(RBD.lnc, method = 'TMM')
+lib.size <- colSums(RBD.lnc)
+CPM.lnc <- cpm(RBD.lnc, 
+               lib.size = lib.size*TMM.norm,
+               log=TRUE, 
+               prior.count = 0.5)
+
+# dim(CPM.lnc) #26157  1462
+dim(CPM.lnc)
+```
+
+```{r}
+df <- CPM.lnc %>% 
+  as.data.frame() %>%
+  rownames_to_column("gene") %>% 
+  mutate(lncRNA=ifelse(gene %in% lncRNAs$gene_id,
+                       "yes","no")) %>% 
+  gather(sample,log2_CPM,-gene,-lncRNA) %>%
+  mutate(Group=ifelse(grepl("BM[0-9]|RO[0-9]", sample), "NBM","AML"))
+
+# head(df)
+dens.plot <- ggplot(data = df, aes(log2_CPM, fill=lncRNA)) +
+  geom_density() +
+  facet_wrap(~Group) +
+  labs(title = "Distribution of lncRNAs in Pediatric AML")
+  
+dens.plot
+# ggsave(filename = "TARGET_AML_lncRNAs_Distribution.svg", plot = dens.plot, device = "pdf",height = 5, width = 7)
+```
+
+```{r}
+#for compatibility keep all gene in RBD in polyA dataset
+polyA.lnc <- polyA[keep,] 
+TMM.norm2 <- calcNormFactors(polyA.lnc, method = 'TMM')
+lib.size2 <- colSums(polyA.lnc)
+
+polyA.CPM.lnc <- cpm(polyA.lnc, 
+               lib.size = lib.size2*TMM.norm2,
+               log=TRUE, 
+               prior.count = 0.5)
+
+dim(polyA.CPM.lnc) #26157   315
+```
+
+```{r}
+Targets <- DE$DE %>% 
+  mutate(Comparison="AMLvsNBM") %>%
+  filter(grepl("^ENSG", gene_id)) %>%
+  filter(gene_id %in% rownames(CPM.lnc))#remove Transposable elements
+  
+
+dim(Targets) #1588   34
+length(unique(Targets$gene_id)) #1452 (1431??)
+head(Targets[,1:5])
+```
+
+```{r}
+targets <- unique(targets$gene_id)
+targets <- setdiff(targets, colnames(CDE.train)) 
+#targets <- c(targets, "ENSG00000248489","ENSG00000281903") #include adult lncRNAs for just a curiosity question
+
+CDE.train <- CDE.train %>%
+  #merge in the log2 TMM CPM normalized expression 
+  left_join(., CPM.lnc[targets,] %>% 
+              t() %>% 
+              as.data.frame() %>% 
+              rownames_to_column("USI"), 
+            by="USI") %>% 
+  ungroup() %>% 
+  mutate(Final.Risk.Group=relevel(as.factor(Final.Risk.Group),ref = "Low")) %>% 
+  as.data.frame() %>%
+  set_rownames(.$USI)
+
+
+head(CDE.train[,1:5])
+dim(CDE.train)
+```
+
+```{r}
+CDE.test <- CDE.test %>% 
+  left_join(.,CPM.lnc[targets,] %>% 
+              t() %>%
+              as.data.frame() %>% 
+              rownames_to_column("USI"), 
+            by="USI") 
+
+dim(CDE.test)
+```
+
+```{r}
+CDE.validation <- CDE.validation %>% 
+    left_join(.,CPM.lnc[targets,] %>% 
+              t() %>%
+              as.data.frame() %>% 
+              rownames_to_column("USI"), 
+            by="USI") 
+
+dim(CDE.validation)
+```
+
+```{r}
+CDE.validation2 <- CDE.validation2 %>% 
+    left_join(.,polyA.CPM.lnc[targets,] %>%
+              t() %>%
+              as.data.frame() %>% 
+              rownames_to_column("USI"), 
+            by="USI") 
+
+dim(CDE.validation2)
+```
+
+
+# Univariate survival Coxph regressions
+
+```{r}
+Genes <- grep("^ENSG[0-9]", colnames(CDE.train), value=TRUE)
+  
+ures <- lapply(Genes, cox_reg, CDE=CDE.train) %>% 
+  bind_rows() %>% 
+  dplyr::rename(P.Value="P-value",Hazard.Ratio="Hazard Ratio") %>% 
+  mutate(Adj.P.value=p.adjust(P.Value, method = "BH")) %>%
+  left_join(., select(DEGs.DF,gene_id,gene_name,
+                      gene_type,matches("Comparison"),logFC,
+                      FC.BH.PVal=adj.P.Val),
+            by=c("Variable"="gene_id"))
+
+
+sig.ures <- ures %>% 
+  mutate(Sig.05=P.Value < 0.05, 
+         Sig.10=P.Value < 0.1)  %>%
+  filter(Sig.05 == TRUE | Sig.10 == TRUE) %>%
+  arrange(desc(Hazard.Ratio))
+
+dim(sig.ures) #446 univariate significantly associated 
+head(sig.ures)
+
+
+# filter(sig.ures, Sig.10==TRUE, logFC > 0, Comparison=="AMLvsNBM") %>% 
+#   dim()
+```
+
+
+# Model fit with LASSO Cox 
+
+## LASSO for AML vs NBM DEGs
+
+```{r}
+uv_upreg_0.1 <- cox_glmnet_workflow(CDE.train = CDE.train, 
+                              targets = filter(sig.ures, Comparison=="AMLvsNBM",logFC > 1, Sig.10) %>% 
+                                         pull(Variable),
+                              IDmap = lncRNAs, 
+                              N.Groups = 4,
+                              oneSE=FALSE,
+                              sig.mres = filter(sig.mres,Comparison=="AMLvsNBM"),
+                              CDE.test = CDE.test,
+                              CDE.validation = CDE.validation,
+                              CDE.validation2 = CDE.validation2)
+
+dim(uv_upreg_0.1$nonZero.train.coef) #37 gene model
+extract_metrics_df(uv_upreg_0.1$error.metrics,V=TRUE,V2=TRUE)
+uv_upreg_0.1$AIC
+# uv_upreg_0.1 <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")
+```
+
+```{r fig.height=7, fig.width=15}
+gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.EFS.Med[1:3],
+                                uv_upreg_0.1$error.metrics$KM.EFS.Perc[1:3]), ncol=3, nrow=2) #%>% 
+  # ggsave(filename = "lncRNA_Score_EFS_KM_TrTeVal.svg", device = "pdf", units = "in", dpi=300, height = 7, width = 9)
+
+gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.OS.Med[1:3],
+                                uv_upreg_0.1$error.metrics$KM.OS.Perc[1:3]), ncol=3, nrow=2) #%>% 
+    # ggsave(filename = "lncRNA_Score_OS_KM_TrTeVal.svg", device = "pdf", units = "in", dpi=300, height = 7, width = 9)
+
+```
+
+```{r}
+#permforms very well in median groups/quintile groups for test/V1 (HR=2.3). min EFS is testing set for continous variable(HR=2.0)
+all_upreg <- cox_glmnet_workflow(CDE.train = CDE.train, 
+                                 targets = filter(targets,
+                                                  Comparison=="AMLvsNBM",logFC > 1) %>% 
+                                              pull(gene_id), 
+                                 IDmap = lncRNAs, 
+                                 sig.mres = filter(sig.mres,Comparison=="AMLvsNBM"),
+                                 CDE.test = CDE.test, 
+                                 CDE.validation = CDE.validation,
+                                 CDE.validation2 = CDE.validation2)
+
+
+dim(all_upreg$nonZero.train.coef) #90 gene model
+all_upreg$AIC
+# saveRDS(all_upreg,"TARGET_AML_RBD_Kallisto_lncRNA_Survival_Score.RDS")
+```
+
+```{r fig.height=7, fig.width=15}
+gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.EFS.Med,
+                                uv_upreg_0.1$error.metrics$KM.EFS.Perc), ncol=4, nrow=2)
+
+gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.OS.Med,
+                                uv_upreg_0.1$error.metrics$KM.OS.Perc), ncol=4, nrow=2)
+```
+
+```{r}
+#OK on EFS median groups min HR=1.8. EFS for continous variable only 1.8HR
+all_DEG <- cox_glmnet_workflow(CDE.train = CDE.train, 
+                               targets = filter(targets, Comparison=="AMLvsNBM") %>%
+                                          pull(gene_id), 
+                               IDmap = lncRNAs, 
+                               sig.mres = filter(sig.mres,Comparison=="AMLvsNBM"),
+                               CDE.test = CDE.test, 
+                               CDE.validation = CDE.validation,
+                               CDE.validation2 = CDE.validation2)
+
+# extract_metrics_df(all_DEG$error.metrics,V=TRUE,V2=TRUE)
+all_DEG$AIC
+# dim(all_DEG$nonZero.train.coef) #76 gene model
+```
+
+
+# Select the "Best" Model
+
+```{r}
+#updated CDEs to more clean version
+final.mod <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")
+
+final.mod$Model.Comparison.df <- final.mod$Model.Comparison.df %>% 
+  mutate_at(vars(Set), 
+            ~factor(gsub("Test","Validation1",gsub("^Validation$","Validation2", .)),
+                    levels=c("Train","Validation1","Validation2")))
+
+dim(final.mod$Model.Comparison.df)
+```
+
+## CDEs for Todd and Rob
+
+```{r}
+library(xlsx)
+filename <- "TARGET_AML_lncRNA_Signature_forAnalysis_04.08.20.xlsx"
+
+# select(CDE.train, USI,Reg.,Set,
+#        Positive_vs_Negative=lnc.Pos.Neg) %>% 
+#   write.xlsx(., file=filename, 
+#              sheetName="Training Set")
+# 
+# select(CDE.test, USI,Reg.,Set,
+#        Positive_vs_Negative=lnc.Pos.Neg) %>% 
+#   write.xlsx(., file=filename, append=T,
+#              sheetName="Testing Set")
+# 
+# select(CDE.validation, USI,Reg.,Set,
+#        Positive_vs_Negative=lnc.Pos.Neg) %>% 
+#  write.xlsx(., file=filename, append = T,
+#              sheetName="Validation Set")
+# 
+# select(CDE.survdat, USI,Reg.,Set,
+#        Positive_vs_Negative=lnc.Pos.Neg) %>% 
+#   write.xlsx(., file=filename, 
+#              sheetName="All Patients")
+
+
+```
+
+
+## Updates to Clinical Covars
+
+```{r}
+#updated CDEs to more clean version
+final.mod <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.01.20.RDS")
+
+final.mod$Model.Comparison.df <- CDE.survdat
+
+dim(CDE.survdat)
+# saveRDS(final.mod, "Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")
+# table(final.mod$Model.Comparison.df$Cyto.Fusion.Molecular.Risk_update)
+```
+
+
+## Visualize  lncRNA Scores and Gene Expression 
+
+```{r}
+library(ggpubr)
+```
+
+```{r fig.height=4, fig.width=10}
+scores_waterfall <- ggplot(filter(final.mod$Model.Comparison.df, Set != "Validation2"), 
+       aes(x=reorder(USI,lnc.Score), y=lnc.Score,
+           fill=lnc.Percentile.Groups_AllPts, color=lnc.Percentile.Groups_AllPts)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  # facet_wrap(~Set, scales = "free_x") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold")) +
+  labs(x="Patient") 
+
+# scores_waterfall
+```
+
+```{r fig.height=3}
+scores_waterfall_bySet <- lapply(unique(final.mod$Model.Comparison.df$Set), function(set) {
+  
+  wf <- ggplot(filter(final.mod$Model.Comparison.df, Set==set),
+       aes(x=reorder(USI,lnc.Score), y=lnc.Score,
+           fill=lnc.Percentile.Groups, color=lnc.Percentile.Groups)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  facet_wrap(~Set, scales = "free_x") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14, color="black"),
+        axis.text = element_text(color="black"),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold"), 
+        legend.position = "top") +
+  labs(x="Patient",y="lncScore") + 
+  scale_color_manual(values = rev(brewer.pal(4, "Set1"))) +
+  scale_fill_manual(values = rev(brewer.pal(4, "Set1")))
+  
+  # ggsave(wf, filename = paste0("Figures/lncScore_Waterfall/", paste0("TARGET_AML_lncScore_Waterfall_", set,"_plot.pdf")),
+  #      device="pdf", dpi = 450,units="in", height = 4, width = 7)
+})
+
+# scores_waterfall_bySet
+```
+
+```{r fig.height=4}
+LSC_waterfall <- ggplot(final.mod$Model.Comparison.df,  #filter(final.mod$Model.Comparison.df, Set != "Validation2")
+       aes(x=reorder(USI,LSC17.Score), y=LSC17.Score,
+           fill=LSC.Percentile.Groups_AllPts, 
+           color=LSC.Percentile.Groups_AllPts)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold")) +
+  labs(x="Patient") 
+
+# LSC_waterfall
+```
+
+
+```{r fig.height=4}
+LSC_waterfall_bySet <- ggplot(final.mod$Model.Comparison.df,  #filter(final.mod$Model.Comparison.df, Set != "Validation2")
+       aes(x=reorder(USI,LSC17.Score), y=LSC17.Score,
+           fill=LSC.Percentile.Groups, color=LSC.Percentile.Groups)) + 
+  scale_y_continuous(breaks = seq(-1.5,1.5, by=0.5),limits = c(-1.5,1.5)) +
+  geom_bar(stat="identity") + 
+  facet_wrap(~Set, scales = "free_x") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(), 
+        text=element_text(size=14),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(face = "bold")) +
+  labs(x="Patient") 
+
+# LSC_waterfall_bySet
+```
+
+```{r}
+#Expression waterfall plots of the individual genes. 
+waterfall.plots <- lapply(grep("^ENSG", colnames(final.mod$Model.Comparison.df), value=TRUE), 
+                          function(x) plots(final.mod$Model.Comparison.df, x, log=FALSE))
+
+```
+
+```{r fig.height=10, fig.width=11}
+# pdf("TARGET_AML_37_lncRNA_Signature_Expression_waterfalls.svg", height = 10, width = 11)
+gridExtra::marrangeGrob(grobs=waterfall.plots, nrow=3, ncol=2)
+# dev.off()
+```
+
+```{r}
+bplots <- lapply(grep("^ENSG", colnames(final.mod$Model.Comparison.df), value=TRUE), 
+                          function(x) plots(final.mod$Model.Comparison.df, x, log=TRUE, type="box"))
+```
+
+```{r fig.height=6, fig.width=8}
+gridExtra::marrangeGrob(grobs=bplots, nrow=2, ncol=1)
+```
+
+## Re-examine Cut-points for "optimal" discretized Groups
+
+Based on the lncScores waterfall plot above, we will do the postive/negative score. 
+
+```{r}
+ggplot(final.mod$Model.Comparison.df,
+       aes(y=LSC17.Score, x=lnc.Score, color=LSC.Percentile.Groups)) + 
+  geom_point() + 
+  geom_vline(xintercept = median(final.mod$Model.Comparison.df$lnc.Score)) + 
+  geom_hline(yintercept = median(final.mod$Model.Comparison.df$LSC17.Score)) + 
+  geom_smooth(mapping=aes(x=lnc.Score, y=LSC17.Score),
+              method = "lm", inherit.aes = FALSE) #pearson cor =0.51 
+```
+
+
+### Using Scores > 0 Cutoff
+
+```{r fig.width=11, fig.height=6}
+km.pos.neg <- KM.plots(df=final.mod$Model.Comparison.df,
+                       group_vars = NULL,
+                       type="OS", 
+                       covariate = "lnc.Pos.Neg",
+                       cohort = "1031",
+                       cc=c("Pos"="brown3","Neg"="dodgerblue4"),
+                       riskTable =FALSE)
+
+# km.pos.neg
+# pdf("Figures/2020.12.02_PDF_Images/lncScore_pos_vs_neg_Cutoff_Allpts_KM.svg", height = 6.5, width=11)
+# svg("Figures/2020.12.02_PDF_Images/lncScore_pos_vs_neg_Cutoff_1031pts_KM.svg", height = 6.5, width=11)
+grid.arrange(grobs=c(km.pos.neg$OS, km.pos.neg$EFS),
+             ncol=2)
+# dev.off()
+```
+
+```{r}
+# summary(km.pos.neg$OS.cox[[1]]) # 3.06 HR
+# summary(km.pos.neg$EFS.cox[[1]]) #2.42 HR
+
+summ_table_lncAll <- outcome_table(fit=km.pos.neg$OS.fit[[1]]) %>% 
+                       mutate(`End Point`="Overall Survival") %>% 
+  bind_rows(., outcome_table(fit=km.pos.neg$EFS.fit[[1]]) %>%
+                        mutate(`End Point`="Event-Free Survival")) %>%
+  mutate(`Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Group,`End Point`,`Number Patients per Group`,
+         `Time (years)`,
+         `Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`)
+
+summ_table_lncAll
+
+# write.csv(summ_table_lncAll,"manuscript/Supplemental_Tables/TARGET_AML_pos_neg_lncScore_Allpts_OS_EFS_Table.csv", row.names = F)
+
+```
+
+
+```{r fig.width=14, fig.height=6}
+km.pos.neg.set <- KM.plots(df=final.mod$Model.Comparison.df,
+                          group_vars =  "Set",
+                           type="OS", 
+                          covariate = "lnc.Pos.Neg",
+                          cohort = "1031", 
+                          max.year = 8)
+
+
+km.pos.neg.set
+```
+
+```{r}
+# ggsave(plot=km.pos.neg.set$OS[[1]], filename = "Figures/KM_Pos_vs_Neg//lncScore_Pos_Neg_Train_OS_KM.pdf",
+#        device = "pdf", dpi=300, height = 6, width = 6, units="in")
+# ggsave(plot=km.pos.neg.set$OS[[2]], filename = "Figures/KM_Pos_vs_Neg/lncScore_Pos_Neg_Test_OS_KM.pdf",
+#        device = "pdf", dpi=300, height = 6, width = 6, units="in")
+# ggsave(plot=km.pos.neg.set$OS[[3]], filename = "Figures/KM_Pos_vs_Neg/lncScore_Pos_Neg_Val_OS_KM.pdf",
+#        device = "pdf", dpi=300, height = 6, width = 6, units="in")
+# 
+# ggsave(plot=km.pos.neg.set$EFS[[1]], filename = "Figures/KM_Pos_vs_Neg/lncScore_Pos_Neg_Train_EFS_KM.pdf", device = "pdf",
+#        dpi=300, height = 7, width = 7, units="in")
+# ggsave(plot=km.pos.neg.set$EFS[[2]], filename = "Figures/KM_Pos_vs_Neg/lncScore_Pos_Neg_Test_EFS_KM.pdf", device = "pdf",
+#        dpi=300, height = 7, width = 7, units="in")
+# ggsave(plot=km.pos.neg.set$EFS[[3]], filename = "Figures/KM_Pos_vs_Neg/lncScore_Pos_Neg_Val_EFS_KM.pdf", device = "pdf",
+#        dpi=300, height = 7, width = 7, units="in")
+```
+
+```{r}
+cox_table <- lapply(km.pos.neg.set$OS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                      mutate(End_Point="Overall Survival")) %>% 
+  bind_rows(., lapply(km.pos.neg.set$EFS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                        mutate(End_Point="Event-Free Survival"))) %>% 
+  mutate(Set=rep(km.pos.neg.set$Set, 2),
+         Group=gsub("lnc.Pos.Neg","",Group),
+         Reference="Neg_lncScore", 
+         `P-value`=ifelse(`P-value` == 0, "<0.001", `P-value`)) %>%
+  select(Set,Group,Reference,End_Point, everything(), -Variable)
+
+cox_table
+# write.csv(cox_table, "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_Cox_Regression.csv", row.names = FALSE)
+```
+
+```{r}
+pvalues_os <- sapply(km.pos.neg.set$OS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+  set_names(km.pos.neg.set$Set) %>% 
+  ifelse(.==0,"<0.001", .)
+pvalues_efs <- sapply(km.pos.neg.set$EFS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+      set_names(km.pos.neg.set$Set) %>% 
+      ifelse(.==0,"<0.001", .)
+
+
+summ_table <- summ_table_lnc.cm <- lapply(1:3, function(x) outcome_table(fit=km.pos.neg.set$OS.fit[[x]], pvalues = pvalues_os[x]) %>% 
+                       mutate(`End Point`="Overall Survival")) %>% 
+  bind_rows(., lapply(1:3, function(x) outcome_table(fit=km.pos.neg.set$EFS.fit[[x]], pvalues = pvalues_efs[x]) %>%
+                        mutate(`End Point`="Event-Free Survival"))) %>%
+  mutate(Set=rep(rep(km.pos.neg.set$Set, each=2), 2),
+         `p-value`=ifelse(is.na(`p-value`), "ref", as.character(`p-value`)),
+         `Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Group,Set,`End Point`,`Number Patients per Group`,`Time (years)`,`Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`)
+
+
+
+
+summ_table
+# write.csv(summ_table, "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_OS_EFS_Table.csv", row.names = FALSE)
+```
+
+
+## Examine LSC17 in lncGroups 
+
+```{r fig.width=11, fig.height=6}
+LSC.all.pts <- KM.plots(df = final.mod$Model.Comparison.df, 
+                    group_vars = NULL, 
+                    type = "OS",
+                    covariate = "LSC.Med.Groups_AllPts",
+                    cohort = "1031")
+
+# pdf("Figures/2020.12.02_PDF_Images/LSC17/LSC17_Groups_Median_Cut_KM.svg", height = 6, width = 11)
+grid.arrange(grobs=c(LSC.all.pts$OS, LSC.all.pts$EFS),ncol=2)
+# dev.off()
+```
+
+```{r fig.width=7, fig.height=7}
+# pdf("Figures/PDF_Images/LSC17_Groups_Median_Cut_EFS_KMplot.svg", height = 7, width = 7)
+plot(LSC.all.pts$EFS[[1]])
+# dev.off()
+```
+
+```{r}
+summary(LSC.all.pts$OS.cox[[1]]) #HR = 2.28
+summary(LSC.all.pts$EFS.cox[[1]]) #HR = 1.75
+```
+
+```{r}
+LSC.q4.pts <- KM.plots(df = final.mod$Model.Comparison.df, 
+                    "AML", 
+                    type = "OS",
+                    covariate = "LSC.q4vq123",
+                    cohort = "1031")
+```
+
+```{r}
+summary(LSC.q4.pts$OS.cox[[1]]) #HR = 2.19
+summary(LSC.q4.pts$EFS.cox[[1]]) #HR = 1.83
+```
+
+```{r fig.width=10.5, fig.height=6}
+grid.arrange(grobs=c(LSC.q4.pts$OS, LSC.q4.pts$EFS),ncol=2)
+```
+
+```{r}
+table(final.mod$Model.Comparison.df$LSC.Median.Groups,
+      final.mod$Model.Comparison.df$lnc.Median.Groups)
+```
+
+There is a difference of 208 patients which are differntly classified between LSC17 and lncRNA 
+
+```{r fig.width=10, fig.height=8}
+LSC.Perc.pts <- KM.plots(df = final.mod$Model.Comparison.df, 
+                    "Group", 
+                    type = "OS",
+                    covariate = "LSC.Percentile.Groups_AllPts",
+                    cohort = "1031")
+
+
+# pdf("LSC17_Groups_Quartile_Cut_KM.svg", height = 8, width = 10)
+grid.arrange(grobs=c(LSC.Perc.pts$OS, LSC.Perc.pts$EFS), ncol=2)
+# dev.off()
+```
+
+```{r fig.width=12, fig.height=6}
+LSC.lnc.asIs <- KM.plots(df=final.mod$Model.Comparison.df %>% 
+                           mutate(lnc.Med.vs.LSC=paste(lnc.Med.Groups_AllPts,
+                            LSC.Med.Groups_AllPts, sep="_LSC:")), 
+                         group_vars = NULL,
+                         covariate = "lnc.Med.vs.LSC",
+                         type="OS",
+                         cohort="1031")
+
+
+grid.arrange(grobs=c(LSC.lnc.asIs$OS, LSC.lnc.asIs$EFS), ncol=2)
+```
+
+
+```{r}
+summary(LSC.lnc.asIs$OS.cox[[1]])
+summary(LSC.lnc.asIs$EFS.cox[[1]])
+```
+
+
+```{r}
+LSC.lnc.Low <- KM.plots(df=filter(final.mod$Model.Comparison.df,lnc.Med.Groups_AllPts == "low") %>% 
+                                mutate(LSC17.win.LncLow=quantcut(LSC17.Score,q=2,na.rm=FALSE, 
+                                                                 labels=c("low","high"))), 
+                         group_vars = NULL,
+                         covariate = "LSC17.win.LncLow",
+                         type="OS",
+                         cohort="1031")
+
+grid.arrange(grobs=c(LSC.lnc.Low$OS, LSC.lnc.Low$EFS), ncol=2)
+```
+
+```{r fig.height=10, fig.width=10}
+LSC.lnc.Hi <- KM.plots(df=filter(final.mod$Model.Comparison.df,lnc.Med.Groups_AllPts == "high") %>% 
+                                mutate(LSC17.win.LncHi=quantcut(LSC17.Score,q=2,na.rm=FALSE, 
+                                                                 labels=c("low","high"))), 
+                         group_vars = NULL,
+                         covariate = "LSC17.win.LncHi",
+                         type="OS",
+                         cohort="1031")
+
+# grid.arrange(grobs=c(LSC.lnc.Hi$OS, LSC.lnc.Hi$EFS,LSC.lnc.Low$OS, LSC.lnc.Low$EFS), ncol=2) %>% ggsave(plot = ., filename = "LSC_within_LncScore_Groups.svg", device = "pdf", height = 10, width = 10, units = "in", dpi=150)
+```
+
+
+## Multivariate Model with LSC17 and lncScore
+
+```{r}
+
+vars_LSC17 <- c("log10.WBC","LSC.Med.Groups_AllPts","Cyto.Fusion.Molecular.Risk_update")
+final.mod$Model.Comparison.df$Cyto.Fusion.Molecular.Risk_update <- factor(final.mod$Model.Comparison.df$Cyto.Fusion.Molecular.Risk_update,
+                                                         levels=c("Standard","Low","High"))
+#final.mod$Model.Comparison.df$Set <- droplevels(final.mod$Model.Comparison.df$Set)
+groups <- unique(final.mod$Model.Comparison.df$Set) 
+
+lsc_multi_cont <- lapply(groups, 
+                 function(x) cox_reg("lnc.Score",
+                                     filter(final.mod$Model.Comparison.df, Set==x),
+                                     vars_LSC17)) 
+
+
+# lsc_multi_cont
+
+lsc_multi_pn <- lapply(groups, 
+                 function(x) cox_reg("lnc.Pos.Neg",
+                                     filter(final.mod$Model.Comparison.df, Set==x),
+                                     vars_LSC17)) %>% 
+  bind_rows() %>% 
+  mutate(Set=rep(groups, each=5),
+         Time_point="Event-Free Survival",
+         Group=gsub("lnc.Pos.Neg|LSC.Med.Groups_AllPts", "", Group)) %>%
+  
+  select(Set,Time_point, everything())
+
+# lsc_multi_pn
+```
+
+```{r}
+mvm.lsc <- cox_reg(gene_name = "lnc.Pos.Neg",
+        CDE = final.mod$Model.Comparison.df, variables = vars_LSC17) %>%
+  mutate(Time_point="Event-Free Survival",
+         Group=gsub("lnc.Pos.Neg|LSC.Med.Groups_AllPts", "", Group),
+         Variable=gsub("Pos|[Hh]igh|Low", "", Variable)) %>% 
+  bind_rows(., cox_reg(gene_name = "lnc.Pos.Neg",
+                        CDE = final.mod$Model.Comparison.df, variables = vars_LSC17, OS=TRUE) %>% 
+  mutate(Time_point="Overall Survival",
+         Group=gsub("lnc.Pos.Neg|LSC.Med.Groups_AllPts", "", Group),
+         Variable=gsub("Pos|[Hh]igh|Low", "", Variable))) %>% 
+  select(Time_point, everything()) 
+
+
+mvm.lsc
+# write.csv(mvm.lsc, "Survival/TARGET_AML_lncScore_LSC17_multivariate_Cox_Regression_Table.csv", row.names = F)
+```
+
+## Multivariable Model  with lncScores
+
+```{r}
+Percent_Reallocated <- final.mod$Model.Comparison.df %>% 
+  filter(Protocol=="AAML1031") %>% 
+  group_by(lnc.Pos.Neg, Cyto.Fusion.Molecular.Risk_update) %>% 
+  summarise(N=n(), 
+            Median_WBC=median(log10.WBC, na.rm = T)) %>% 
+  ungroup() %>% 
+  
+  group_by(Cyto.Fusion.Molecular.Risk_update) %>% 
+  mutate(Total_N_CMrisk=sum(N)) %>% 
+  ungroup() %>%
+  
+  mutate(Percent_CMrisk_Reallocated=case_when(
+    lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ round(N/Total_N_CMrisk*100,
+                                                                                   digits=2),
+    lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "Low" ~ NA_real_,
+    lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "High" ~ round(N/Total_N_CMrisk*100,
+                                                                               digits=2),
+    lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ NA_real_,
+    lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ NA_real_,
+    lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ NA_real_))
+
+Percent_Reallocated
+# write.csv(Percent_Reallocated,"Survival/TARGET_AML_AAML1031_lncScore_CMrisk_Percent_Reallocated.csv", row.names = FALSE)
+```
+
+```{r}
+incl_vars <- NULL
+# incl_vars <- c("log10.WBC","Cyto.Fusion.Molecular.Risk_update")
+# incl_vars <- c("log10.WBC","Classical.Risk.group")
+
+input <- filter(final.mod$Model.Comparison.df, Protocol=="AAML1031")
+# input <- final.mod$Model.Comparison.df
+# input <- filter(input, Classical.Risk.group != "Unknown")
+
+
+
+input$Cyto.Fusion.Molecular.Risk_update <- factor(input$Cyto.Fusion.Molecular.Risk_update,
+                                                         levels=c("Standard","Low","High"))
+input$Classical.Risk.group <- factor(input$Classical.Risk.group, 
+                                     levels=c("Standard","Low","High"))
+groups <- unique(input$Set) 
+
+#Univariate Cox model - the lncScore continuous variable to significant compared to the other CMrisk
+#but Multivariable NOT significant :( 
+m_cont <- lapply(groups,
+                 function(x) cox_reg("lnc.Score",
+                                     filter(input, Set==x),
+                                     incl_vars))
+
+names(m_cont) <- groups
+m_cont
+```
+
+```{r}
+incl_vars <- c("log10.WBC","Cyto.Fusion.Molecular.Risk_update")
+temp <- input  %>% 
+  mutate(Set=as.character(Set)) %>%
+  mutate(Set=ifelse(grepl("Validation", Set),"Validation", Set)) #see if high p-values are due to small numbers - and it is true.
+
+table(temp$Set)
+
+groups <- unique(temp$Set)
+test_EFS <- lapply(groups, 
+                 function(x) cox_reg("lnc.Pos.Neg",
+                                     filter(temp, Set==x), 
+                                     incl_vars)) %>% 
+    bind_rows() %>%
+    mutate(
+            Set=rep(groups, each=4),
+           # N=rep(c(781,519),each=4),
+           Time_point="Event-Free Survival") %>%
+    select(Set,Time_point, everything())
+
+
+test_OS <- lapply(groups, 
+                 function(x) cox_reg("lnc.Pos.Neg",
+                                     filter(temp, Set==x), 
+                                     incl_vars, 
+                                     OS=TRUE)) %>% 
+  bind_rows() %>%
+  mutate(
+        Set=rep(groups, each=4),
+        #  N=rep(c(781,519),each=4),
+         Time_point="Overall Survival") %>%
+  select(Set,Time_point, everything())
+
+
+bind_rows(test_EFS,test_OS)
+
+# write.csv(bind_rows(test_EFS,test_OS),
+#           "Survival/TARGET_AML_lncScore_mulivariate_Cox_Regression_All_Samples_by_Train_Test.csv", row.names = F)
+
+```
+
+```{r}
+groups <- unique(input$Set) 
+m_pn_EFS <- lapply(groups, 
+                 function(x) cox_reg("lnc.Pos.Neg",
+                                     filter(input, Set==x), 
+                                     incl_vars)) %>% 
+    bind_rows() %>%
+    mutate(Set=rep(groups, each=4),
+           Time_point="Event-Free Survival") %>% 
+    select(Set,Time_point, everything())
+
+# m_pn_EFS
+
+
+m_pn_OS <- lapply(groups, 
+                 function(x) cox_reg("lnc.Pos.Neg",
+                                     filter(input, Set==x), 
+                                     incl_vars, 
+                                     OS=TRUE)) %>% 
+  bind_rows() %>%
+  mutate(Set=rep(groups, each=4),
+         Time_point="Overall Survival") %>%
+  select(Set,Time_point, everything())
+
+
+
+bind_rows(m_pn_EFS,m_pn_OS)
+
+# write.csv(bind_rows(m_pn_EFS,m_pn_OS),
+#           "Survival/TARGET_AML_lncScore_mulivariate_Cox_Regression_bySet.csv", row.names = F)
+# 
+
+```
+
+
+```{r}
+OS_mv <- cox_reg(gene_name = "lnc.Pos.Neg",
+        CDE = input, variables = incl_vars, OS=TRUE) %>% 
+  mutate(Set="All Patients",
+         Time_point="Overall Survival") %>% 
+  select(Set,Time_point, everything())
+
+EFS_mv <- cox_reg(gene_name = "lnc.Pos.Neg",
+        CDE = input, variables = incl_vars) %>% 
+    mutate(Set="All Patients",
+         Time_point="Event-Free Survival") %>% 
+  select(Set,Time_point, everything())
+
+
+
+# write.csv(bind_rows(OS_mv, EFS_mv),
+#           "Survival/TARGET_AML_lncScore_mulivariate_Cox_Regression_byAll_Samples.csv", row.names = F)
+```
+
+
+
+# Compare lncScore to risk Groups
+
+```{r}
+table(final.mod$Model.Comparison.df$lnc.Pos.Neg, 
+      final.mod$Model.Comparison.df$Cyto.Fusion.Molecular.Risk_update) #%>% 
+  # write.csv(.,"LncScore_per_CMrisk_table.csv")
+```
+
+```{r fig.height=7, fig.width=7}
+RG.Only_all <- KM.plots(df=final.mod$Model.Comparison.df,
+                    group_vars = NULL,
+                    covariate = "Cyto.Fusion.Molecular.Risk_update",
+                    cohort="1031",
+                    cc=c("High"="firebrick2",
+                          "Low"="dodgerblue2",
+                          "Standard"="darkgoldenrod2"),
+                    max.year = 8)
+
+# ggsave(filename = "Figures/2020.12.02_PDF_Images/TARGET_AML_CMrisk_KMplot.svg",
+#        device = "svg", height = 7, width = 12,
+#        plot=grid.arrange(grobs=c(RG.Only_all$OS, RG.Only_all$EFS), ncol=2))
+```
+
+```{r}
+pvalues_oscm <- sapply(RG.Only_all$OS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+  set_names(RG.Only_all$Group) %>% 
+  ifelse(.==0,"<0.001", .)
+
+pvalues_efscm <- sapply(RG.Only_all$EFS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+      set_names(RG.Only_all$Group) %>% 
+      ifelse(.==0,"<0.001", .)
+
+
+summ_table_cmrisk <- outcome_table(fit=RG.Only_all$OS.fit[[1]]) %>% 
+                       mutate(`End Point`="Overall Survival") %>% 
+  bind_rows(., outcome_table(fit=RG.Only_all$EFS.fit[[1]]) %>%
+                        mutate(`End Point`="Event-Free Survival")) %>%
+  mutate(`Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Group,`End Point`,`Number Patients per Group`,
+         `Time (years)`,
+         `Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`)
+
+summ_table_cmrisk
+# write.csv(summ_table_cmrisk,"manuscript/Supplemental_Tables/TARGET_AML_CMrisk_OS_EFS_Table.csv", row.names = FALSE)
+```
+
+
+```{r}
+flip <- KM.plots(df=final.mod$Model.Comparison.df,
+                 group_vars = "lnc.Pos.Neg",
+                 type = "OS",
+                 covariate = "Cyto.Fusion.Molecular.Risk_update",
+                 cohort = "1031", 
+                 cc = c("High"="firebrick2",
+                        "Low"="dodgerblue2",
+                        "Standard"="darkgoldenrod2"),
+                 # cc = c("Pos"="firebrick2", 
+                 #        "Neg"="dodgerblue2"),
+                 max.year = 8)
+
+
+# ggsave(plot = flip$OS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/Neg_ReAllocation_RiskGroups_OS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# ggsave(plot = flip$EFS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/Neg_ReAllocation_RiskGroups_EFS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# 
+# ggsave(plot = flip$OS[[2]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/Pos_ReAllocation_RiskGroups_OS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# ggsave(plot = flip$EFS[[2]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/Pos_ReAllocation_RiskGroups_EFS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+#        
+#        
+```
+
+
+
+```{r }
+RGvsLncA <- KM.plots(df=filter(final.mod$Model.Comparison.df,
+                               Protocol=="AAML1031",
+                               Cyto.Fusion.Molecular.Risk_update == "High"), 
+                         group_vars = NULL,
+                         covariate = "lnc.Pos.Neg",
+                         type="OS",
+                         cohort="1031", 
+                          cc=c("Neg"="red", "Pos"="firebrick4"), 
+                     max.year = 8)
+
+RGvsLncB <- KM.plots(df=filter(final.mod$Model.Comparison.df,
+                                Protocol=="AAML1031",
+                               Cyto.Fusion.Molecular.Risk_update == "Low"), 
+                         group_vars = NULL,
+                         covariate = "lnc.Pos.Neg",
+                         type="OS",
+                         cohort="1031", 
+                         cc=c("Neg"="dodgerblue", "Pos"="navy"), 
+                     max.year = 8)
+
+RGvsLncC <- KM.plots(df=filter(final.mod$Model.Comparison.df, 
+                                Protocol=="AAML1031",
+                               Cyto.Fusion.Molecular.Risk_update == "Standard"), 
+                         group_vars = NULL,
+                         covariate = "lnc.Pos.Neg",
+                         type="OS",
+                         cohort="1031", 
+                         cc=c("Neg"="darkgoldenrod2", "Pos"="darkgoldenrod4"), 
+                         max.year = 8)
+
+# plot(RGvsLncC$OS[[1]])
+```
+
+
+```{r fig.width=16,fig.height=5}
+# grid.arrange(grobs=c(RGvsLncA$OS,
+#                      RGvsLncB$OS,
+#                      RGvsLncC$OS), nrow=1)
+
+# ggsave(plot = RGvsLncA$OS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/AAML1031/LncScore_within_CMrisk_Groups_HighRisk_OS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+# ggsave(plot = RGvsLncB$OS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/AAML1031/LncScore_within_CMrisk_Groups_LowRisk_OS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+# ggsave(plot = RGvsLncC$OS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/LncScore_within_CMrisk_Groups_StandardRisk_OS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+# 
+# 
+# 
+# ggsave(plot = RGvsLncA$EFS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/AAML1031/LncScore_within_CMrisk_Groups_HighRisk_EFS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+# ggsave(plot = RGvsLncB$EFS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/AAML1031/LncScore_within_CMrisk_Groups_LowRisk_EFS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+# ggsave(plot = RGvsLncC$EFS[[1]],
+#        filename = "Figures/2020.12.02_PDF_Images/AAML1031/LncScore_within_CMrisk_Groups_StandardRisk_EFS_KM.svg",
+#        device = "svg", height = 6, width = 5, units = "in", dpi=300)
+```
+
+
+```{r}
+km.lncRNA.CMrisk <- KM.plots(df=final.mod$Model.Comparison.df, 
+                         group_vars = "Cyto.Fusion.Molecular.Risk_update",
+                         covariate = "lnc.Pos.Neg",
+                         type="OS",
+                         cohort="1031", 
+                         max.year = 8, 
+                         riskTable = FALSE)
+
+cox_table_lnc.cm <- lapply(km.lncRNA.CMrisk$OS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                      mutate(End_Point="Overall Survival")) %>% 
+  bind_rows(., lapply(km.lncRNA.CMrisk$EFS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                        mutate(End_Point="Event-Free Survival"))) %>% 
+  mutate(Set=rep(km.lncRNA.CMrisk$Cyto.Fusion.Molecular.Risk_update, 2),
+         Group=gsub("lnc.Pos.Neg","",Group),
+         Reference="Neg_lncScore", 
+         `P-value`=ifelse(`P-value` == 0, "<0.001", `P-value`)) %>%
+  select(Set,Group,Reference,End_Point, everything(), -Variable)
+
+cox_table_lnc.cm
+# write.csv(cox_table_lnc.cm, "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_within_CMrisk_Cox_Regression.csv", row.names = FALSE)
+```
+
+```{r}
+pvalues_os <- sapply(km.lncRNA.CMrisk$OS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+  set_names(km.lncRNA.CMrisk$Cyto.Fusion.Molecular.Risk_update) %>% 
+  ifelse(.==0,"<0.001", .)
+pvalues_efs <- sapply(km.lncRNA.CMrisk$EFS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+      set_names(km.lncRNA.CMrisk$Cyto.Fusion.Molecular.Risk_update) %>% 
+      ifelse(.==0,"<0.001", .)
+
+
+summ_table_lnc.cm <- lapply(1:3, function(x) outcome_table(fit=km.lncRNA.CMrisk$OS.fit[[x]], pvalues = pvalues_os[x]) %>% 
+                       mutate(`End Point`="Overall Survival")) %>% 
+  bind_rows(., lapply(1:3, function(x) outcome_table(fit=km.lncRNA.CMrisk$EFS.fit[[x]], pvalues = pvalues_efs[x]) %>%
+                        mutate(`End Point`="Event-Free Survival"))) %>%
+  mutate(Set=rep(rep(km.lncRNA.CMrisk$Cyto.Fusion.Molecular.Risk_update, each=2), 2),
+         `p-value`=ifelse(is.na(`p-value`), "ref", as.character(`p-value`)),
+         `Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Group,Set,`End Point`,`Number Patients per Group`,`Time (years)`,`Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`)
+
+
+summ_table_lnc.cm
+# colnames(summ_table_lnc.cm)
+# write.csv(summ_table_lnc.cm,
+#           "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_within_CMrisk_OS_EFS_Table.csv", row.names = FALSE)
+
+```
+
+### Box plots of lncScores
+
+```{r}
+Subgroups <- final.mod$Model.Comparison.df %>% 
+  mutate(Set_Combined=ifelse(Set=="Train", as.character(Set), "Validation")) %>% 
+  mutate(Subgroups=case_when(
+    grepl("RUNX1-RUNX1T1", Primary.Fusion) |  grepl("RUNX1-RUNX1T1", Additional.Fusions.CNV) ~ "RUNX1-RUNX1T1",
+    grepl("CBFB-MYH11", Primary.Fusion) |  grepl("CBFB-MYH11", Additional.Fusions.CNV) ~ "CBFB-MYH11",
+    grepl("KMT2A", Primary.Fusion) |  grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A",
+    grepl("NUP98-NSD1", Primary.Fusion) |  grepl("NUP98-NSD1", Additional.Fusions.CNV) ~ "NUP98",
+    grepl("NUP98-KDM5A", Primary.Fusion) |  grepl("NUP98-KDM5A", Additional.Fusions.CNV) ~ "NUP98",
+    grepl("NUP98-Other", Major.Group_update) ~ "NUP98",
+    grepl("CBFA2T3-GLIS2", Primary.Fusion) |  grepl("CBFA2T3-GLIS2", Additional.Fusions.CNV) ~ "CBFA2T3-GLIS2",
+        
+    # grepl("DEK-NUP214", Primary.Fusion) |  grepl("DEK-NUP214", Additional.Fusions.CNV) ~ "DEK-NUP214",
+    # grepl("Monosomy 7|monosomy7|del5q", Primary.Fusion) |  grepl("Monosomy 7|monosomy7|del5q", Additional.Fusions.CNV) ~ "Monosomy7 / Del5q",
+        # grepl("none|None", Primary.Fusion) |  grepl("none|None", Additional.Fusions.CNV) ~ "No Fusion",
+    TRUE ~ "None or Other")) %>% 
+  mutate_at(vars(Classical.Risk.group),~ifelse(is.na(.) | grepl("10|30", .), "Unknown", . )) %>% 
+  mutate(KMT2A=case_when(
+    grepl("KMT2A",Primary.Fusion) ~ Primary.Fusion,
+    grepl("KMT2A",Additional.Fusions.CNV) ~ Additional.Fusions.CNV, 
+    TRUE ~ "otherAML")) %>% 
+  
+  #KMT2A Groups
+  group_by(KMT2A)%>%
+  mutate(KMT2A_Clean=case_when(
+   grepl("KMT2A",KMT2A) & n() < 10 ~ "KMT2A-X",
+   TRUE ~ KMT2A)) %>% 
+  ungroup() %>% 
+  mutate(KMT2A=KMT2A_Clean) %>%
+  select(-KMT2A_Clean) %>% 
+  
+  # #lncScore score outcome by Subgroup
+  # group_by(Subgroups) %>%
+  # mutate(lncScore_Group_withinSubgroups=ifelse(LSC17_Score >= median(LSC17_Score), 
+  #                                           "high", "low")) %>% 
+  # ungroup() %>% 
+  
+
+  mutate(KMT2A_Final.Risk=case_when(
+      Subgroups == "KMT2A" & Final.Risk.Group == "High" ~ "High Risk KMT2A", 
+      Subgroups == "KMT2A" & Final.Risk.Group == "Low" ~ "Low Risk KMT2A"), 
+    KMT2A_Cyto.Fus.Risk=case_when(
+      Subgroups == "KMT2A" & Cyto.Fusion.Molecular.Risk_update == "High" ~ "High Risk KMT2A", 
+      Subgroups == "KMT2A" & Cyto.Fusion.Molecular.Risk_update == "Low" ~ "Low Risk KMT2A", 
+      Subgroups == "KMT2A" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ "Stand. Risk KMT2A"),
+    KMT2A_Classical.Risk=case_when(
+      Subgroups == "KMT2A" & Classical.Risk.group == "High" ~ "High Risk KMT2A", 
+      Subgroups == "KMT2A" & Classical.Risk.group == "Low" ~ "Low Risk KMT2A", 
+      Subgroups == "KMT2A" & Classical.Risk.group == "Standard" ~ "Stand. Risk KMT2A"))
+
+dim(Subgroups) #1298
+table(Subgroups$Subgroups)
+```
+
+
+
+```{r fig.width=10}
+scores.box <- ggplot(data=Subgroups, 
+                     aes(x= Subgroups, y=lnc.Score)) +
+  geom_boxplot(outlier.shape=NA, width = 0.8, position = position_dodge(width = 2)) +
+  geom_jitter(aes(color=lnc.Pos.Neg),alpha=0.5) + 
+  facet_wrap(~Set_Combined) +
+  theme_classic() +
+
+  scale_color_manual(values = c("Pos"="firebrick2", "Neg"="dodgerblue2")) +
+  labs(x="AML Fusion",y="lncScore") +
+  theme(text=element_text(size=20), 
+        axis.text.x = element_text(angle=25, vjust = 1, hjust=1, color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.ticks.length.x = unit(0.33,"cm"),
+        plot.margin = margin(l=2,t=1, unit="cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+  
+# scores.box
+
+# ggsave("lncScores_All_Patients_Boxplots_by_Train_Validation_Set.svg", scores.box, device = "svg", height = 5,width = 12)
+
+
+# pdf("Figures/boxplots/lncScores_All_Patients_Boxplots_by_Train_Validation_Set.pdf", height = 5,width = 12)
+scores.box
+# dev.off()
+```
+
+```{r}
+scores.RG.box <- ggplot(data=Subgroups, 
+                     aes(x= Cyto.Fusion.Molecular.Risk_update, y=lnc.Score)) +
+  geom_boxplot(outlier.shape=NA, width = 0.8, position = position_dodge(width = 2)) +
+  geom_jitter(aes(color=lnc.Pos.Neg),alpha=0.5) + 
+  facet_wrap(~Set_Combined) +
+  theme_classic() +
+
+  scale_color_manual(values = c("Pos"="firebrick2", "Neg"="dodgerblue2")) +
+  # scale_y_continuous(breaks = seq(-0.8,0.8, by=0.2)) +
+  labs(x="AML Risk Group",y="lncScore") +
+  theme(text=element_text(size=20), 
+        axis.text.x = element_text(angle=25, vjust = 1, hjust=1, color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.ticks.length.x = unit(0.33,"cm"),
+        plot.margin = margin(l=2,t=1, unit="cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+# pdf("Figures/boxplots/lncScores_All_Patients_in_CFM_Risk.Groups_Boxplots_by_Train_Validation.pdf", height = 5, width = 12)
+scores.RG.box
+# dev.off()
+
+# ggsave("Figures/2020.12.02_PDF_Images/lncScores_All_Patients_in_RiskGroups_Boxplots.svg", scores.RG.box, device = "svg", height = 5,width = 10)
+```
+
+```{r}
+scores.KMT2A.box <- ggplot(data=filter(Subgroups,grepl("KMT2A", KMT2A)), 
+                     aes(x= KMT2A, y = lnc.Score)) +
+  geom_boxplot(outlier.shape=NA, width = 0.8, position = position_dodge(width = 2)) +
+  geom_jitter(aes(color=lnc.Pos.Neg),alpha=0.5) + 
+  facet_wrap(~Set_Combined) +
+  theme_classic() +
+
+  scale_color_manual(values = c("Pos"="firebrick2", "Neg"="dodgerblue2")) +
+  # scale_y_continuous(breaks = seq(-0.8,0.8, by=0.2)) +
+  labs(x="AML Risk Group",y="lncScore") +
+  theme(text=element_text(size=20), 
+        axis.text.x = element_text(angle=25, vjust = 1, hjust=1, color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.ticks.length.x = unit(0.33,"cm"),
+        plot.margin = margin(l=2,t=1, unit="cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+# pdf("Figures/boxplots/lncScores_All_Patients_in_KMT2A_Fusions_Boxplots_by_Train_Validation.pdf", height = 5, width = 12)
+scores.KMT2A.box
+# dev.off()
+```
+
+```{r}
+scores.KMT2A.RG.box <- ggplot(data=filter(Subgroups,grepl("KMT2A", KMT2A)), 
+                     aes(x= KMT2A_Cyto.Fus.Risk, y = lnc.Score)) +
+  geom_boxplot(outlier.shape=NA, width = 0.8, position = position_dodge(width = 2)) +
+  geom_jitter(aes(color=lnc.Pos.Neg),alpha=0.5) + 
+  facet_wrap(~Set_Combined) +
+  theme_classic() +
+
+  scale_color_manual(values = c("Pos"="firebrick2", "Neg"="dodgerblue2")) +
+  # scale_y_continuous(breaks = seq(-0.8,0.8, by=0.2)) +
+  labs(x="AML Risk Group",y="lncScore") +
+  theme(text=element_text(size=20), 
+        axis.text.x = element_text(angle=25, vjust = 1, hjust=1, color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.ticks.length.x = unit(0.33,"cm"),
+        plot.margin = margin(l=2,t=1, unit="cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+# pdf("Figures/boxplots/lncScores_All_Patients_in_KMT2A_Fusions_Boxplots_by_CFM_Risk.Groups_and_Train_Validation.pdf", height = 5, width = 12)
+scores.KMT2A.RG.box
+# dev.off()
+```
+
+```{r}
+none.other <- Subgroups %>% 
+  filter(Subgroups=="None or Other") %>% 
+  select(USI, Primary.Fusion,Mutations.Category, Major.Group_update, matches("FLT3|NPM|CEBP|WT1"), everything()) %>% 
+  mutate(None_Other_Subgroups=case_when(
+    grepl("NPM1-MLF1|RUNX1-CBFA2T3|RBM15-MKL1|MLLT10|KAT6A|monosomy7",Major.Group_update) ~ "OtherAML",
+    grepl("ETS", Major.Group_update) ~ "ETS_Fusion",
+    TRUE ~ Major.Group_update)) %>% 
+  mutate_at(vars(None_Other_Subgroups), ~case_when(
+    .=="OtherAML" &   Primary.Fusion=="None" ~ "No.Primary.Fusion",
+    TRUE ~ .))
+
+# none.other %>% 
+#   group_by(Set_Combined,None_Other_Subgroups) %>% 
+#   dplyr::count() %>% 
+#   ungroup() %>% 
+#   pivot_wider(names_from=Set_Combined, values_from=n) %>% 
+#   write.csv(.,"TARGET_AML_lncScores_None_Other_Subgroups_Table.csv", row.names = FALSE)
+
+table(none.other$None_Other_Subgroups)
+```
+
+```{r fig.width=12, fig.height=5}
+scores.box.none.other <- ggplot(data=none.other, aes(x= None_Other_Subgroups, y=lnc.Score)) +
+  geom_boxplot(outlier.shape=NA, width = 0.8, position = position_dodge(width = 2)) +
+  geom_jitter(aes(color=lnc.Pos.Neg),alpha=0.5) + 
+  facet_wrap(~Set_Combined) +
+  theme_classic() +
+
+  scale_color_manual(values = c("Pos"="firebrick2", "Neg"="dodgerblue2")) +
+  labs(x="AML Fusion",y="lncScore") +
+  theme(text=element_text(size=20), 
+        axis.text.x = element_text(angle=25, vjust = 1, hjust=1, color="black"),
+        axis.text.y = element_text(color="black"),
+        axis.ticks.length.x = unit(0.33,"cm"),
+        plot.margin = margin(l=2,t=1, unit="cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+
+# pdf("Figures/boxplots/lncScores_All_Patients_in_None.Other_Boxplots_by_Train_Validation.pdf", height = 5, width = 12)
+scores.box.none.other
+# dev.off()
+```
+
+
+
+
+## KM plots in Cytomolecular/Fusion
+
+```{r}
+lncScores.Fusion.KM.val <- KM.plots(df=filter(Subgroups, 
+                                              Subgroups != "RUNX1-RUNX1T1"),
+                                group_vars=c("Subgroups","Set_Combined"),
+                                type = "OS",
+                                covariate = "lnc.Pos.Neg",
+                                cohort = "1031")
+
+lncScores.Fusion.KM.val
+```
+
+```{r}
+# lapply(1:nrow(lncScores.Fusion.KM.val), function(i){
+#   
+#   fus <- gsub(" ", ".", lncScores.Fusion.KM.val[i,"Group"]) 
+#   
+#   pdf(paste0("Figures/KM_Fusion_Groups/lncScores_All_Patients_in_",fus,"_KM_by_Train_Validation.pdf"), 
+#       height = 7, width = 12)
+#   grid.arrange(grobs=c(lncScores.Fusion.KM.val$OS[i], lncScores.Fusion.KM.val$EFS[i]), ncol=2)
+#   dev.off()
+#   
+# })
+
+
+OS_EFS_by_Fusion_Tables <- purrr::map_dfr(1:nrow(lncScores.Fusion.KM.val), function(i){
+
+  fus <- gsub(" ", ".", lncScores.Fusion.KM.val[i,"Group"])
+
+  # pdf(paste0("Figures/KM_Fusion_Groups/lncScores_All_Patients_in_",fus,"_KM_by_Train_Validation.pdf"),
+  #     height = 7, width = 12)
+  
+  diff <- lncScores.Fusion.KM.val$OS.diff[[i]]
+  p <- pchisq(diff$chisq, length(diff$n)-1, lower.tail = FALSE)
+  try(tab <- outcome_table(fit=lncScores.Fusion.KM.val$OS.fit[[i]], time=c(5), pvalues = p))
+
+  diff <- lncScores.Fusion.KM.val$EFS.diff[[i]]
+  p.efs <- pchisq(diff$chisq, length(diff$n)-1, lower.tail = FALSE)
+  try(tab2 <- outcome_table(fit=lncScores.Fusion.KM.val$EFS.fit[[i]], time=c(5), pvalues = p))
+
+  
+  if(exists("tab")){
+    tab <- bind_rows(select(tab, Percent=matches("Percent"), everything()),
+                     select(tab2, Percent=matches("Percent"), everything())) %>%
+      mutate(type=rep(c("OS","EFS"), each=2),
+             lncScore=rep(c("Pos","Neg"), times=2)) %>%
+      mutate(Group=fus) %>%
+      select(Group,lncScore, type, everything())
+  }
+})
+
+# write.csv(OS_EFS_by_Fusion_Tables, "manuscript/Supplemental_Tables/within_Fusions/TARGET_AML_lncScores_OS_EFS_by_Fusion_Tables_10.5.2021.csv", row.names = FALSE)
+
+
+Cox_by_Fusion_Tables <- purrr::map_dfr(1:nrow(lncScores.Fusion.KM.val), function(i){
+
+  fus <- gsub(" ", ".", lncScores.Fusion.KM.val[i,"Group"])
+
+  # pdf(paste0("Figures/KM_Fusion_Groups/lncScores_All_Patients_in_",fus,"_KM_by_Train_Validation.pdf"),
+  #     height = 7, width = 12)
+
+  try(tab <- coxSummaryTable(lncScores.Fusion.KM.val$OS.cox[[i]]))
+  try(tab2 <- coxSummaryTable(lncScores.Fusion.KM.val$EFS.cox[[i]]))
+
+  if(exists("tab")){
+    tab <- bind_rows(tab, tab2) %>%
+      mutate(Type=c("OS","EFS")) %>%
+      mutate(Group=fus) %>%
+      select(Group,Type, everything())
+  }
+})
+
+# write.csv(Cox_by_Fusion_Tables, "manuscript/Supplemental_Tables/within_Fusions/TARGET_AML_lncScores_OS_EFS_Cox_by_Fusion_Tables_10.5.2021.csv", row.names = FALSE)
+```
+
+```{r}
+lncScores.Fusion.KM <- KM.plots(df=filter(Subgroups, Subgroups != "RUNX1-RUNX1T1"),
+                                group_vars="Subgroups",
+                                type = "OS",
+                                covariate = "lnc.Pos.Neg",
+                                cohort = "1031")
+```
+
+```{r}
+# lapply(unique(lncScores.Fusion.KM$Subgroups), function(group){
+#   df <- filter(lncScores.Fusion.KM, Subgroups == group) 
+#   km <- grid.arrange(grobs=c(df$OS, df$EFS), ncol=2)
+#   ggsave(paste0("Figures/2020.12.02_PDF_Images/", group,"_All_Patients_lncScore_KM.svg"),
+#          plot=km, device = "svg", height = 6,width = 10)
+# })
+```
+
+```{r}
+cox_table_lnc.fus <- lapply(lncScores.Fusion.KM$OS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                      mutate(End_Point="Overall Survival")) %>% 
+  bind_rows(., lapply(lncScores.Fusion.KM$EFS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                        mutate(End_Point="Event-Free Survival"))) %>% 
+  mutate(Set=rep(lncScores.Fusion.KM$Group,2),
+         Group=gsub("lnc.Pos.Neg","",Group),
+         Reference="Neg_lncScore",
+         `P-value`=ifelse(`P-value` == 0, "<0.001", `P-value`)) %>%
+  select(Set,Group,Reference,End_Point, everything(), -Variable)
+
+
+cox_table_lnc.fus
+dim(cox_table_lnc.fus)
+
+# write.csv(cox_table_lnc.fus, "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_within_Fusions_Cox_Regression.csv", row.names = FALSE)
+```
+
+
+```{r}
+subset <- lncScores.Fusion.KM %>% 
+  filter(grepl("None|KMT2A", Subgroups))
+
+pvalues_os_fus <- sapply(subset$OS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+  set_names(subset$Subgroups) %>% 
+  ifelse(.==0,"<0.001", .)
+pvalues_efs_fus <- sapply(subset$EFS.diff, function(x) calc_KMcurve_pvalues(x)) %>% 
+      set_names(subset$Subgroups) %>% 
+      ifelse(.==0,"<0.001", .)
+
+
+summ_table_lnc.fus <- lapply(1:nrow(subset), 
+                             function(x) outcome_table(fit=subset$OS.fit[[x]], pvalues = pvalues_os_fus[x]) %>% 
+                       mutate(`End Point`="Overall Survival")) %>% 
+  bind_rows(., lapply(1:nrow(subset),
+                        function(x) outcome_table(fit=subset$EFS.fit[[x]], pvalues = pvalues_efs_fus[x]) %>%
+                        mutate(`End Point`="Event-Free Survival"))) %>% 
+  
+  mutate(Set=rep(rep(subset$Group, each=2), 2),
+         `p-value`=ifelse(is.na(`p-value`), "ref", as.character(`p-value`)),
+         `Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Group,Set,`End Point`,`Number Patients per Group`,`Time (years)`,
+         `Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`)
+
+
+summ_table_lnc.fus
+# colnames(summ_table_lnc.cm)
+# write.csv(summ_table_lnc.fus,
+#           "manuscript/Supplemental_Tables/TARGET_AML_pos_vs_neg_lncScore_within_Fusions_OS_EFS_Table.csv", row.names = FALSE)
+
+```
+
+
+
+
+```{r}
+lncScores.None.Other.KM.val <- KM.plots(df=filter(none.other, 
+                                              None_Other_Subgroups != "CEBPA"),
+                                group_vars=c("None_Other_Subgroups","Set_Combined"),
+                                type = "OS",
+                                covariate = "lnc.Pos.Neg",
+                                cohort = "1031")
+
+lncScores.None.Other.KM.val
+```
+
+```{r fig.width=10, fig.height=7}
+lapply(seq(1,nrow(lncScores.None.Other.KM.val),by=2), function(i){
+
+  grp <- gsub(" ", ".", lncScores.None.Other.KM.val[i,"None_Other_Subgroups...1"])
+  name <- paste0("Figures/KM_Fusion_Groups/None_Other_Subsets/lncScores_All_Patients_in_",grp,"_KM_by_Train_Validation.pdf")
+  # 
+  pdf(name, height = 12, width = 12)
+  grid.arrange(grobs=c(lncScores.None.Other.KM.val$OS[i], lncScores.None.Other.KM.val$EFS[i],
+                       lncScores.None.Other.KM.val$OS[i+1], lncScores.None.Other.KM.val$EFS[i+1]), ncol=2)
+  dev.off()
+
+})
+```
+
+
+
+# Combined lncScore + Cyto/Mol Risk 
+
+## KM plot Integrated lncScore/CMrisk
+
+```{r}
+#Keep it restricted to AAML1031 for evaluation of re-allocation
+final.mod$Model.Comparison.df <- final.mod$Model.Comparison.df %>%
+  filter(Protocol=="AAML1031")
+
+dim(final.mod$Model.Comparison.df)
+
+# write.csv(select(final.mod$Model.Comparison.df,USI, matches("lnc")),
+#           "TARGET_AML_AAML1031_lncScore_Cohort.csv", row.names = F)
+```
+
+```{r}
+reallo_cols <- c("Cyto.Fusion.Molecular.Risk_update","lncRNA_plus_CM_Risk","lncRNA_plus_CM_Risk_basedonEFS","lncRNA_plus_CM_Risk_2Groups")
+
+# sapply(final.mod$Model.Comparison.df[,reallo_cols], table) %>% 
+#   bind_rows() %>% 
+#   mutate(Classification_Scheme=reallo_cols) %>% 
+#   gather(class, number, -Classification_Scheme) %>% 
+#   arrange(Classification_Scheme) %>% 
+#   filter(!is.na(number)) %>% 
+#   write.csv(., "Reallocation_Schemes_Tables.csv", row.names = F)
+```
+
+```{r}
+integrated_column <- "lncRNA_plus_CM_Risk"
+# integrated_column <- "lncRNA_plus_CM_Risk_basedonEFS"
+# integrated_column <- "lncRNA_plus_CM_Risk_2Groups"
+```
+
+```{r fig.height=6, fig.width=6}
+comb <- KM.plots(df=final.mod$Model.Comparison.df,
+                 group_vars = NULL,
+                 type = "OS",
+                 covariate = integrated_column,
+                 cohort = "1031", 
+                 cc = c("High"="firebrick2",
+                        "Low"="dodgerblue2",
+                        "Standard"="darkgoldenrod2"),
+                 # cc = c("Pos"="firebrick2", 
+                 #        "Neg"="dodgerblue2"),
+                 max.year = 8)
+
+plot(comb$OS[[1]])
+plot(comb$EFS[[1]])
+
+# ggsave(plot = comb$OS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/",integrated_column,"_ReAllocation_RiskGroups_OS_KM.svg"),
+#        device = "svg",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# 
+# ggsave(plot = comb$EFS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/", integrated_column,"_ReAllocation_RiskGroups_EFS_KM.svg"),
+#        device = "svg",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# #       
+
+
+# ggsave(filename = paste0("Figures/2020.12.02_PDF_Images/",integrated_column ,"_KMplot.svg"),
+#        device = "svg", height = 7, width = 12,
+#        plot=grid.arrange(grobs=c(comb$OS, comb$EFS), ncol=2))
+```
+
+Vectorized input to `element_text()` is not officially supported.
+Results may be unexpected or may change in future versions of ggplot2.Vectorized input to `element_text()` is not officially supported.
+Results may be unexpected or may change in future versions of ggplot2.
+
+```{r fig.height=6, fig.width=6}
+# table(final.mod$Model.Comparison.df$SCT.in.1st.CR)
+comb_rmSCT <- KM.plots(df=filter(final.mod$Model.Comparison.df,SCT.in.1st.CR != "Yes"),
+                 group_vars = NULL,
+                 type = "OS",
+                 covariate = integrated_column,
+                 cohort = "1031", 
+                 cc = c("High"="firebrick2", 
+                        "Low"="dodgerblue2", 
+                        "Standard"="darkgoldenrod2"),
+                 max.year = 8)
+
+plot(comb_rmSCT$OS[[1]])
+plot(comb_rmSCT$EFS[[1]])
+# comb_rmSCT
+# ggsave(plot = comb_rmSCT$OS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/",integrated_column,"_ReAllocation_removeSCT_OS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# ggsave(plot = comb_rmSCT$EFS[[1]],
+#        filename = paste0("Figures/2020.12.02_PDF_Images/", integrated_column,"_ReAllocation_removeSCT_EFS_KM.svg"),
+#        device = "pdf",
+#        height = 6,
+#        width = 6, units = "in", dpi=300)
+# #        
+```
+
+
+```{r}
+cox_table_int <- lapply(comb$OS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                      mutate(End_Point="Overall Survival")) %>% 
+  bind_rows(., lapply(comb$EFS.cox, function(x) coxSummaryTable(coxph.res = x) %>% 
+                        mutate(End_Point="Event-Free Survival"))) %>% 
+  mutate(Variable=gsub("Low|High|Pos","",Variable),
+         Group=gsub(integrated_column,"",Group),
+         Reference="Standard_Integrated_Risk_Group",
+         `P-value`=ifelse(`P-value` == 0, "<0.001", `P-value`)) %>%
+  select(Variable,Group,Reference,End_Point, everything())
+
+cox_table_int
+# write.csv(cox_table_int, "manuscript/Supplemental_Tables/TARGET_AML_AAML1031_Integrated_lncScore_CMrisk_Cox_Regression.csv", row.names = FALSE)
+```
+
+
+```{r}
+summ_table_int <- outcome_table(fit=comb$OS.fit[[1]]) %>% 
+                       mutate(`End Point`="Overall Survival") %>% 
+  bind_rows(., outcome_table(fit=comb$EFS.fit[[1]]) %>%
+                        mutate(`End Point`="Event-Free Survival")) %>%
+  mutate(Variable=integrated_column,
+         `Survival Probability (%)`=ifelse(is.na(`Percent OS`), `Percent EFS`, `Percent OS`)) %>%
+  select(Variable,Group,`End Point`,`Number Patients per Group`,`Time (years)`,`Survival Probability (%)`,
+         everything(), -`Percent OS`, -`Percent EFS`) %>% 
+  mutate(Group=factor(Group, levels=c("High", "Standard", "Low"))) %>% 
+  
+  arrange(desc(`End Point`), Group)
+
+
+summ_table_int
+
+# write.csv(summ_table_int,
+#           paste0("manuscript/Supplemental_Tables/TARGET_AML_AAML1031", integrated_column,"_OS_EFS_Table.csv"),
+#           row.names = FALSE)
+
+```
+
+## KM plot EOI Intergrated lncScore/SMrisks
+
+```{r}
+missing_Data <- final.mod$Model.Comparison.df %>% 
+  select(Set,USI,matches("lnc"), matches("^CR"),
+         Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1:Days.to.DFS.from.end.of.INT.1.for.pts.who.continue.on.TX.at.end.of.INT.I,
+         matches("^MRD"))  %>% 
+  filter(is.na(Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1))
+
+
+# table(missing_Data$CR.status.at.end.of.course.1)
+# table(missing_Data$CR.status.at.end.of.course.2)
+```
+
+For Soheil:
+That is EFS and OS from End of induction so we can compare the LncScore to our cytomolecular/MRD combo.  If similar, that would argue for using a single platform.
+
+```{r}
+forPostInductionI <- final.mod$Model.Comparison.df %>% 
+  select(Set,USI,Cyto.Fusion.Molecular.Risk_update,
+         matches("lnc|lsc|"), 
+         Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1:Days.to.DFS.from.end.of.INT.1.for.pts.who.continue.on.TX.at.end.of.INT.I,
+         matches("^MRD")) %>% 
+  mutate_at(vars(matches("\\.indicator$")), ~case_when(
+    .=="Censored" ~ 0,
+    .=="Event" ~ 1,
+    .=="Unknown" ~ NA_real_)) %>% 
+  dplyr::filter( ! is.na(Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1)) %>% 
+  
+  mutate(lncScores_by_MRD1=case_when(
+                lnc.Pos.Neg == "Pos" & MRD.at.end.of.course.1 == "Yes" ~ "lncPos_MRD+",
+                lnc.Pos.Neg == "Neg" & MRD.at.end.of.course.1 == "Yes" ~ "lncNeg_MRD+",
+                lnc.Pos.Neg == "Pos" & MRD.at.end.of.course.1 == "No" ~ "lncPos_MRD-",
+                lnc.Pos.Neg == "Neg" & MRD.at.end.of.course.1 == "No" ~ "lncNeg_MRD-")) %>% 
+  mutate(CMrisk_High_by_MRD1=case_when(
+           Cyto.Fusion.Molecular.Risk_update == "High" & MRD.at.end.of.course.1 == "Yes" ~ "CMrisk_High_MRD+",
+           Cyto.Fusion.Molecular.Risk_update == "High" & MRD.at.end.of.course.1 == "No" ~ "CMrisk_High_MRD-"),
+
+         CMrisk_Standard_by_MRD1=case_when(
+           Cyto.Fusion.Molecular.Risk_update == "Standard" & MRD.at.end.of.course.1 == "Yes" ~ "CMrisk_Std_MRD+",
+           Cyto.Fusion.Molecular.Risk_update == "Standard" & MRD.at.end.of.course.1 == "No" ~ "CMrisk_Std_MRD-"),
+
+         CMrisk_Low_by_MRD1=case_when(
+           Cyto.Fusion.Molecular.Risk_update == "Low" & MRD.at.end.of.course.1 == "Yes" ~ "CMrisk_Low_MRD+",
+           Cyto.Fusion.Molecular.Risk_update == "Low" & MRD.at.end.of.course.1 == "No" ~ "CMrisk_Low_MRD-")) %>%
+
+  mutate(Integrated_High_Risk_by_MRD1=case_when(
+           !! as.symbol(integrated_column) == "High" & MRD.at.end.of.course.1 == "Yes" ~ "High_MRD+",
+           !! as.symbol(integrated_column) == "High" & MRD.at.end.of.course.1 == "No" ~ "High_MRD-"),
+    Integrated_Low_Risk_by_MRD1=case_when(
+            !! as.symbol(integrated_column) == "Low" & MRD.at.end.of.course.1 == "Yes" ~ "Low_MRD+",
+            !! as.symbol(integrated_column) == "Low" & MRD.at.end.of.course.1 == "No" ~ "Low_MRD-"),
+    Integrated_Standard_Risk_by_MRD1=case_when(
+             !! as.symbol(integrated_column) == "Standard" & MRD.at.end.of.course.1 == "Yes" ~ "Standard_MRD+",
+            !! as.symbol(integrated_column) == "Standard" & MRD.at.end.of.course.1 == "No" ~ "Standard_MRD-"),
+
+    Integrated_High_Risk_by_MRD2=case_when(
+            !! as.symbol(integrated_column) == "High" & MRD.at.end.of.course.2 == "Yes" ~ "High_MRD+",
+            !! as.symbol(integrated_column) == "High" & MRD.at.end.of.course.2 == "No" ~ "High_MRD-"),
+    Integrated_Low_Risk_by_MRD2=case_when(
+            !! as.symbol(integrated_column) == "Low" & MRD.at.end.of.course.2 == "Yes" ~ "Low_MRD+",
+            !! as.symbol(integrated_column) == "Low" & MRD.at.end.of.course.2 == "No" ~ "Low_MRD-"),
+    Integrated_Standard_Risk_by_MRD2=case_when(
+            !! as.symbol(integrated_column) == "Standard" & MRD.at.end.of.course.2 == "Yes" ~ "Standard_MRD+",
+            !! as.symbol(integrated_column) == "Standard" & MRD.at.end.of.course.2 == "No" ~ "Standard_MRD-"))
+
+
+
+
+dim(forPostInductionI) #785  42
+```
+
+```{r}
+riskgroups <- c("High","Low","Standard")
+Cov_Cols <- c(paste0("Integrated_",riskgroups,"_Risk_by_MRD1"),
+              paste0("CMrisk_", riskgroups, "_by_MRD1"), 
+              "lncScores_by_MRD1")
+
+# paste0()
+# Cov_Cols
+
+#Check that no strata has zero patients
+lapply(Cov_Cols, function(x) table(forPostInductionI[[x]], useNA='ifany'))
+
+custom_cols <- list(os.est=c("Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1",
+                             "OS.from.end.of.induction.1.for.pts.who.who.are.CR.at.EOI1.indicator"),
+                    
+                    efs.est=c("Days.to.DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1",
+                              "DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1.indicator"))
+```
+
+```{r}
+#All comers by integrated risk group
+comb_EOI1 <- KM.plots(df=forPostInductionI,
+                 group_vars = NULL,
+                 type = "EOI",
+                 custom_cols = custom_cols,
+                 covariate = "lncRNA_plus_CM_Risk",
+                 cohort = "1031", 
+                 cc = c("High"="firebrick4", 
+                        "Low"="dodgerblue4", 
+                        "Standard"="darkgoldenrod4"),
+                 max.year = 8)
+
+```
+
+```{r}
+grid.arrange(grobs=c(comb_EOI1$OS, comb_EOI1$EFS), ncol=2)
+```
+
+
+```{r}
+lncScore_EOI1 <- KM.plots(df=forPostInductionI,
+                 group_vars = NULL,
+                 type = "EOI",
+                 custom_cols = custom_cols,
+                 covariate = "lnc.Pos.Neg",
+                 cohort = "1031", 
+                 cc = c("Pos"="firebrick4", 
+                        "Neg"="dodgerblue4"),
+                 max.year = 8)
+```
+
+```{r}
+outcome_table(fit = lncScore_EOI1$OS.fit[[1]])
+outcome_table(fit = lncScore_EOI1$OS.fit[[1]])
+
+coxSummaryTable(coxph.res = lncScore_EOI1$OS.cox[[1]])
+coxSummaryTable(coxph.res = lncScore_EOI1$EFS.cox[[1]])
+```
+
+```{r fig.width=10}
+lnc.EOI.km <- grid.arrange(grobs=c(lncScore_EOI1$OS, lncScore_EOI1$EFS), ncol=2)
+# ggsave("TARGET_AML_EndOfInductionI_bylncScore_OS_DFS.pdf",plot=lnc.EOI.km, device = "pdf", height = 7, width = 10)
+```
+
+
+```{r}
+MRD_EOI1 <- KM.plots(df=filter(forPostInductionI,MRD.at.end.of.course.1!= "Unknown"),
+                 group_vars = NULL,
+                 type = "EOI",
+                 custom_cols = custom_cols,
+                 covariate = "MRD.at.end.of.course.1",
+                 cohort = "1031", 
+                 cc = c("Yes"="firebrick4", 
+                        "No"="dodgerblue4"),
+                 max.year = 8)
+```
+
+```{r}
+outcome_table(fit = MRD_EOI1$OS.fit[[1]])
+outcome_table(fit = MRD_EOI1$EFS.fit[[1]])
+
+coxSummaryTable(coxph.res = MRD_EOI1$OS.cox[[1]])
+coxSummaryTable(coxph.res = MRD_EOI1$EFS.cox[[1]])
+```
+
+```{r fig.width=10}
+mrd.km <- grid.arrange(grobs=c(MRD_EOI1$OS, MRD_EOI1$EFS), ncol=2)
+# ggsave("TARGET_AML_EndOfInductionI_byMRD_OS_DFS.pdf",plot=mrd.km, device = "pdf", height = 7, width = 10)
+```
+
+
+https://stackoverflow.com/questions/48219732/pass-a-string-as-variable-name-in-dplyrfilter
+
+```{r warning=FALSE, message=FALSE}
+comb_EOI1_MRD <- lapply(Cov_Cols, function(colName){
+  df <- filter(forPostInductionI, !is.na( !!as.name(colName) ))
+  cc <- c("High"="firebrick",
+           "Low"="dodgerblue",
+           "Standard"="darkgoldenrod")
+  
+  # idx <- which(sapply(names(cc), grepl,x=colName))
+  # cc_tmp <- paste0(cc[idx],c(2,4))
+  # names(cc_tmp) <- unique(df[[colName]])[order(unique(df[[colName]]))]
+  
+  KM.plots(df=df,
+                 group_vars = NULL,
+                 type = "EOI",
+                 custom_cols = custom_cols,
+                 covariate = colName,
+                 cohort = "1031",
+                 # cc = cc_tmp,
+                 max.year = 8)
+
+  
+})
+
+length(comb_EOI1_MRD)
+names(comb_EOI1_MRD) <- Cov_Cols
+```
+
+```{r fig.height=6, fig.width=11}
+# for(i in Cov_Cols){
+#   svg(paste0("Figures/TARGET_AML_AAML1031_",integrated_column,"_",i,"_KM.svg"), height = 6, width = 11)
+#   grid.arrange(grobs=c(comb_EOI1_MRD[[i]]$OS,
+#              comb_EOI1_MRD[[i]]$EFS), ncol=2)
+#   dev.off()
+# }
+```
+
+
+
+
+##Barplot by Cytomol Risk
+
+```{r}
+forBarplot <- final.mod$Model.Comparison.df %>% 
+  select(USI, lnc.Pos.Neg,Cyto.Fusion.Molecular.Risk_update) %>% 
+  
+  group_by(lnc.Pos.Neg,Cyto.Fusion.Molecular.Risk_update) %>% 
+  summarise(N=n()) %>%
+  ungroup() %>% 
+  
+  group_by(Cyto.Fusion.Molecular.Risk_update) %>%
+  mutate(Total_in_Risk_Group=sum(N)) %>%
+  ungroup() %>%
+  
+  group_by(lnc.Pos.Neg,Cyto.Fusion.Molecular.Risk_update) %>%
+  mutate(Percent=(N/Total_in_Risk_Group)*100) %>%
+  ungroup() %>% 
+  
+  mutate_at(vars(Cyto.Fusion.Molecular.Risk_update), 
+            ~factor(., levels=c("High","Standard", "Low")))
+
+# head(forBarplot)
+```
+
+```{r fig.height=5, fig.width=12}
+# pdf("Figures/2020.12.02_PDF_Images/lncScore_Groups_within_CMrisk_Groups_Barplot.svg", height = 5, width = 12)
+ggplot(forBarplot, aes(x=	Cyto.Fusion.Molecular.Risk_update, y=Percent, fill=lnc.Pos.Neg)) +
+  geom_bar(position = 'dodge', stat='identity') +
+  scale_fill_manual(values = c("Neg"="dodgerblue3", "Pos"="firebrick2"),
+                    labels=c("Neg"="Negative", "Pos"="Positive"), 
+                    name="lncScore Groups") +
+  scale_y_continuous(breaks=seq(0,100,by=20),limits = c(0,100)) +
+  labs(x="Cyto/Molecular/Fusion Risk Groups", x="Percent") +
+  theme_classic() +
+  theme(axis.text = element_text(size=18),
+        axis.title = element_text(size=22),
+        legend.title = element_text(size=22),
+        legend.text = element_text(size=18))
+# dev.off()
+```
+
+```{r}
+forBar_pie <- final.mod$Model.Comparison.df %>% 
+  select(USI,Cyto.Fusion.Molecular.Risk_update,
+         lnc.Pos.Neg) %>% 
+  group_by(Cyto.Fusion.Molecular.Risk_update,
+           lnc.Pos.Neg) %>% 
+  mutate(N=n()) %>% 
+  ungroup() %>% 
+  
+  group_by(lnc.Pos.Neg) %>% 
+  mutate(Num.in.Cat=n(), 
+         Percent.in.Cat=round(N/n()*100, digits=2)) %>% 
+  ungroup() %>% 
+  mutate(Group=paste(lnc.Pos.Neg, Cyto.Fusion.Molecular.Risk_update, sep=":"), 
+         Percent.in.Total=round(N/NROW(.)*100, digits=2)) %>%
+  select(Group, N,Num.in.Cat, Percent.in.Cat,Percent.in.Total) %>%
+  unique() %>% 
+  # 
+  separate(Group, c("lnc.Score_Group","Cyto.Fusion.Molecular.Risk_update"), remove = FALSE) %>% 
+  mutate(Cyto.Fusion.Molecular.Risk_update=factor(Cyto.Fusion.Molecular.Risk_update, 
+                                                  levels=c("High","Standard","Low")))
+
+
+# forBar_pie
+# write.csv(forBar_pie, "~/forPie.csv")
+```
+
+```{r}
+bar <- ggplot(data=forBar_pie, 
+       aes(x=lnc.Score_Group,y=Percent.in.Cat, fill=Cyto.Fusion.Molecular.Risk_update)) + 
+  geom_bar(stat="identity", position = "dodge") + 
+  scale_fill_manual(values = c("High"="firebrick2", "Low"="dodgerblue2", "Standard"="darkgoldenrod2")) +
+  theme_classic() + 
+  theme(text = element_text(size=18), 
+        axis.text = element_text(size=20)) + 
+  labs(y="Percent in lncScore Group", x="") 
+
+# bar
+```
+
+
+## Alluvial plot of Integrated Risk Class
+
+```{r}
+library(ggalluvial)
+library(ggfittext)
+library(ggrepel)
+```
+
+
+```{r}
+ggDat_orig <- final.mod$Model.Comparison.df %>% 
+  
+  filter(Protocol=="AAML1031") %>% 
+  
+  select(USI, CMrisk=Cyto.Fusion.Molecular.Risk_update, 
+         lncScore=lnc.Pos.Neg, Integrated=integrated_column) %>% 
+  mutate_all(~as.character(.)) %>%
+  group_by(CMrisk, lncScore, Integrated) %>% 
+  summarise(N=n()) %>%
+  ungroup() %>% 
+  mutate_at(vars(CMrisk,Integrated),~factor(., levels=c("High","Standard","Low"))) %>%
+  mutate_at(vars(lncScore), ~factor(., levels=c("Pos", "Neg")))
+
+
+# head(ggDat_orig)
+```
+
+```{r fig.height=5, fig.width=10, warning=FALSE}
+risk.alluvial <- ggplot(data=ggDat_orig, 
+                    aes(axis1=CMrisk,
+                        axis2=lncScore,
+                        axis3=Integrated,
+                        y=N)) +
+  geom_alluvium(aes(fill=CMrisk), width = 1/3) +
+  geom_stratum(alpha=0.5,width = 1/3,
+               fill=c(rep("white",3), c("white","white"), rep("white",3))) +
+  geom_fit_text(stat="stratum", aes(label = after_stat(stratum)),
+                fontface="bold",
+                grow=TRUE,
+                reflow=TRUE,
+                width = 1/3) +
+  scale_y_continuous(breaks = seq(0,sum(ggDat_orig$N),by=150),#[c(2,4,6,8,10,12,14)]
+                                       limits = c(0,sum(ggDat_orig$N))) +
+  
+  scale_x_discrete(limits=c("CMrisk","lncScore","Integrated"),
+                                     expand = c(0.08,0.08)) +
+  labs(y="Number of Patients") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=18, color="black"),
+                          axis.text.x = element_text(size=22,color="black"),
+                          axis.title = element_text(size=20),
+                          legend.position = "none") +
+  scale_fill_manual(values =  c("High"="firebrick2",
+                                "Low"="dodgerblue2",
+                                 "Standard"="darkgoldenrod2"))
+risk.alluvial
+
+# ggsave("Figures/2020.12.02_PDF_Images/risk.alluvial.svg",risk.alluvial,device = "pdf", dpi=300, units="in", height = 3.5,width = 8)
+# ggsave("Figures/2020.12.02_PDF_Images/AAML1031_risk.alluvial.svg",risk.alluvial,device = "svg", dpi=300, units="in", height = 3.5,width = 8)
+
+# saveRDS(risk.alluvial, "risk.alluvial_dummy.RDS")
+```
+
+
+
+```{r  fig.width=12}
+ggDat <- final.mod$Model.Comparison.df %>% 
+  
+  filter(Protocol=="AAML1031") %>% 
+  
+  select(USI, CMrisk=Cyto.Fusion.Molecular.Risk_update, lncScore=lnc.Pos.Neg, Integrated=all_of(integrated_column)) %>% 
+  mutate_all(~as.character(.)) %>%
+  gather(Classifier,Group, -USI)  %>%
+  mutate(Classifier=factor(Classifier, levels=c("CMrisk","lncScore","Integrated")),
+         Group=factor(Group, levels=c("Pos","Neg","High","Standard","Low"))) %>%
+  arrange(USI)  
+ 
+
+# table(ggDat$Group)
+# table(ggDat$Classifier)
+# levels(ggDat$Classifier)
+# dim(ggDat)
+# head(ggDat)
+
+options(scipen = 999)
+ggplot(ggDat,
+       aes(x = Classifier, 
+           stratum = Group, 
+           label = Group,
+           fill=Group,
+           alluvium = USI)) +
+  
+  geom_flow(width = 1/4) +
+  geom_stratum(alpha = .5, width = 1/4) +
+  ggfittext::geom_fit_text(stat = "stratum", width = 1/4, min.size = 3) +
+  scale_y_continuous(breaks = seq(0,1300,by=100)[c(2,4,6,8,10,12,14)],
+                                       limits = c(0,1300)) +
+  scale_x_discrete(limits=levels(ggDat$Classifier),expand = c(0.05,0.05)) 
+  # 
+  #  labs(y="Number of Patients", x="") +
+  #  theme_classic() +
+  #  theme(legend.position = "none") +
+  #  theme(axis.text.y = element_text(size=18, color="black"),
+  #        axis.text.x = element_text(size=22,color="black"),
+  #       axis.title = element_text(size=20),
+  #       legend.position = "none") 
+  # scale_fill_manual(values =  c("High"="firebrick2",
+  #                                "Low"="dodgerblue2",
+  #                               "Standard"="darkgoldenrod2",
+  #                               "Pos"="firebrick2",
+  #                               "Neg"="dodgerblue2"))
+
+```
+
+
+
+
+##Heatmap with Final Mod lncRNAs
+
+```{r eval=FALSE}
+CPM.lnc <- read_csv("Survival/TARGET_AML_RBD_TMMCPM_forModeling.csv")
+CPM.lnc <- column_to_rownames(CPM.lnc,"X1")
+```
+
+```{r}
+NBM.cols <- colnames(CPM.lnc) %>% grep("^BM|^RO",., value = TRUE)
+temp <- final.mod$Model.Comparison.df %>% 
+  filter(Set=="Train") %>%
+  select(USI) %>%
+  mutate(Group="AML") %>%
+  left_join(., select(merged, USI,Cytogenetic.Category.1), 
+            by="USI") %>% 
+  mutate(Cytogenetic.Category.1=ifelse(is.na(Cytogenetic.Category.1), "Unknown",Cytogenetic.Category.1)) %>%
+  add_row(USI=NBM.cols, 
+          Group = "NBM",
+          Cytogenetic.Category.1="NBM") %>%
+  as.data.frame() %>%
+  set_rownames(.$USI)
+
+# Cytogenetic.Category.1= c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3",
+#                                      "#FF7F00",  "#A65628","black") %>%
+#              set_names(unique(temp$Cytogenetic.Category.1))
+cc <- list(Group=c("AML"="red","NBM"="black"))
+
+mat <- rmDups(count.matrix =  DE$Voom$E, 
+              ID.map = select(IDmap,gene_id, gene_name))
+
+
+anno.obj <- create_HA_Labs_Hmap(expn=mat, 
+                                geneList = DE$DE$gene_name,
+                                goi = final.mod$nonZero.train.coef$gene_name,
+                                CDE=temp, 
+                                cols=c("Group"), 
+                                cc=cc)
+
+hmap <- ComplexHmap(mat = mat[DE$DE$gene_name,],
+                    name = "z-scores",
+                    scale = TRUE,
+                    hmap_anno_obj = anno.obj$annoColumn)
+```
+
+```{r fig.height=10}
+# pdf("AML_vs_NBM_DEGs_trainingSet.svg",  height = 10, width = 8)
+ # png("AML_vs_NBM_DEGs_trainingSet.png",  height = 10, width = 8, units="in", res=600)
+draw(hmap+anno.obj$geneLabels, heatmap_legend_side="top", annotation_legend_side="top")
+# dev.off()
+```
+
+
+# DFS and OS from EOI1 
+
+
+```{r}
+table(CDE.survdat$Final.Risk.Group)
+```
+
+Good risk by lncRNA - how different is this from the Final.Risk Group ?
+Is Final.Risk group (high vs low) the same as lncScore (pos vs neg) from EOI1 
+
+```{r fig.height=7, fig.width=15}
+val <- CDE.survdat %>% 
+  filter(Set != "Train", Final.Risk.Group !="Unknown") %>% 
+  filter(!is.na(Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1)) %>% 
+  mutate_at(vars(OS.from.end.of.induction.1.for.pts.who.who.are.CR.at.EOI1.indicator,
+                 DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1.indicator), ~ifelse(.=="Censored", 0, 1))
+
+
+eoi_cols <- list(os.est=c("Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1",
+                          "OS.from.end.of.induction.1.for.pts.who.who.are.CR.at.EOI1.indicator"),
+                 efs.est=c("Days.to.DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1",
+                           "DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1.indicator"))
+
+by_final.risk <- KM.plots(df=val, group_vars = NULL,
+                          covariate = "Final.Risk.Group",
+                          riskTable = TRUE,
+                          type = "EOI",
+                          cohort="1031",
+                          custom_cols=eoi_cols,
+                          cc = c("Low"="dodgerblue1", "High"="tomato"))
+
+
+# by_final.risk
+
+# pdf("TARGET_AML_Final.Risk.Group_EOI1_KM.pdf", height = 10, width=15)
+grid.arrange(grobs=c(by_final.risk$OS, by_final.risk$EFS), ncol=2)
+# dev.off()
+
+summary(by_final.risk$EFS.fit[[1]], times=c(0,3,5))
+summary(by_final.risk$OS.fit[[1]], times=c(0,3,5))
+```
+
+by Final Risk (cyto mol +MRD )
+low==80%
+high==35%
+
+```{r}
+table(val$lncScore_by_MRD, useNA = "ifany")
+table(val$lncScore_Reallocation_by_MRD, useNA = "ifany")
+```
+
+```{r fig.height=7, fig.width=15}
+val <- CDE.survdat %>% 
+  filter(Set != "Train") %>% 
+  filter(!is.na(Days.to.OS.from.end.of.induction.1.for.pts.who.are.CR.at.EOI1)) %>%
+  mutate_at(vars(OS.from.end.of.induction.1.for.pts.who.who.are.CR.at.EOI1.indicator,
+                 DFS.from.end.of.induction.1.for.patients.who.are.CR.at.EOI1.indicator), ~ifelse(.=="Censored", 0, 1)) %>% 
+  mutate(lncScore_by_MRD=case_when(
+    MRD.at.end.of.course.1=="Yes" ~ paste0(lnc.Pos.Neg, "_MRD+"),
+    MRD.at.end.of.course.1=="No" ~ paste0(lnc.Pos.Neg, "_MRD-"),
+    MRD.at.end.of.course.1=="Unknown" ~ NA_character_,
+    TRUE ~ as.character(lnc.Pos.Neg))) %>% 
+  mutate(lncScore_Reallocation_by_MRD=case_when(
+    lncScore_by_MRD == "Neg_MRD-" ~ "Neg_MRD-", 
+    is.na(lncScore_by_MRD) ~ NA_character_,
+    TRUE ~ "all others"))
+
+
+by_lncScore_DFS <- KM.plots(df=val, 
+                        group_vars = NULL,
+                        type = "EOI",
+                        covariate = "lnc.Pos.Neg", 
+                        cohort="1031",
+                        riskTable = TRUE,
+                        custom_cols = eoi_cols)
+
+by_lncScore_MRD_DFS <- KM.plots(df=filter(val,!is.na(lncScore_by_MRD)), 
+                        group_vars = NULL,
+                        type = "EOI",
+                        covariate = "lncScore_by_MRD", 
+                        cohort="1031",
+                        riskTable = TRUE,
+                        custom_cols = eoi_cols)
+
+
+by_lncScore_MRD_reallo_DSF <- KM.plots(df=filter(val,!is.na(lncScore_Reallocation_by_MRD)), 
+                        group_vars = NULL,
+                        type = "EOI",
+                        covariate = "lncScore_Reallocation_by_MRD", 
+                        cohort="1031",
+                        riskTable = TRUE,
+                        custom_cols = eoi_cols)
+
+
+# pdf("TARGET_AML_lncScore_EOI1_KM.pdf", height = 10, width=15)
+grid.arrange(grobs=c(by_lncScore_DFS$OS, by_lncScore_DFS$EFS), ncol=2)
+# dev.off()
+
+
+# pdf("TARGET_AML_lncScore_by_MRD_EOI1_KM.pdf", height = 10, width=15)
+grid.arrange(grobs=c(by_lncScore_MRD_DFS$OS, by_lncScore_MRD_DFS$EFS), ncol=2)
+# dev.off()
+
+# pdf("TARGET_AML_lncScore_by_MRD_EOI1_Reallocated_2Groups_KM.pdf", height = 10, width=15)
+# grid.arrange(grobs=c(by_lncScore_MRD_reallo_DSF$OS, by_lncScore_MRD_reallo_DSF$EFS), ncol=2)
+# dev.off()
+
+
+# summary(by_lncScore_DFS$EFS.fit[[1]], times=c(0,3,5))
+# summary(by_lncScore_DFS$OS.fit[[1]], times=c(0,3,5))
+
+
+
+# summary(by_lncScore_MRD_DFS$EFS.fit[[1]], times=c(0,3,5))
+# summary(by_lncScore_MRD_DFS$OS.fit[[1]], times=c(0,3,5))
+
+
+
+
+
+DeGSEA::outcome_table(fit = by_lncScore_MRD_reallo_DSF$OS.fit[[1]]) %>% 
+  View()
+
+DeGSEA::outcome_table(fit = by_lncScore_MRD_reallo_DSF$EFS.fit[[1]]) %>% 
+  View()
+
+```
+
+
+
+# Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+

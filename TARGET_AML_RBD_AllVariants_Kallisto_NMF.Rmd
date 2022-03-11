@@ -1,0 +1,741 @@
+---
+title: 'Unsupervised clustering of Fusion Groups in Ribodepleted RNAseq'
+author: "Jenny Smith"
+date: "April 16, 2019"
+output: html_document
+---
+
+#Set-Up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8, dpi = 600)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'/2019.04.05_Kallisto_DE_Transcriptome_MS/'))
+options(stringsAsFactors = FALSE,expressions = 500000)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(DeGSEA) #my custom build R package that used to be imported through `source()`
+library(edgeR)
+library(pheatmap)
+library(RColorBrewer)
+library(readr)
+library(matrixStats)
+getwd()
+```
+
+
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.4.19.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI)) %>% 
+  set_rownames(.$USI)
+
+head(merged[,1:5])
+dim(merged)
+```
+
+#Reference Data
+
+```{r}
+lncRNAs <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29.lncRNAs_GeneLevel.IDmap.csv", row.names = 1)
+
+head(lncRNAs)
+dim(lncRNAs)
+
+table(lncRNAs$gene_type)
+```
+
+```{r}
+#https://www.gencodegenes.org/pages/biotypes.html
+IDmap <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno.csv")
+
+
+genes <- IDmap %>% 
+  filter(!gene_id %in% lncRNAs$gene_id) %>% 
+  filter(!gene_type %in% c("miRNA","sRNA","scaRNA","rRNA","snRNA","scRNA",
+                           "vaultRNA","transposable element","snoRNA","misc_RNA")) %>% 
+  filter(!grepl("pseudogene",gene_type))
+
+# dim(genes)
+# table(genes$gene_type)
+# head(IDmap)
+# dim(IDmap)
+```
+
+
+#Read in the counts
+
+```{r eval=FALSE}
+RBD <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+rownames(RBD) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD))
+
+RBD <- RBD[,-grep("Kas|MV4|BM[0-9]|RO[0-9]|MPN[0-9]", colnames(RBD))]
+
+
+head(RBD[,1:5])
+dim(RBD) #59853  1394
+```
+
+```{r}
+keep <- rowSums(cpm(RBD) >= 1) >= 0.05*ncol(RBD)
+
+TMM.norm <- calcNormFactors(RBD[keep,], method = 'TMM')
+lib.size <- colSums(RBD)
+CPM.all <- cpm(RBD[keep,], 
+               lib.size = lib.size*TMM.norm,
+               log=FALSE)
+
+dim(CPM.all) #25982  1394
+head(CPM.all[,1:5])
+# saveRDS(CPM.all,"TARGET_AML_RBD_TMMCPM_AML.only_forNMF.RDS")
+
+CPM.all <- readRDS("NMF/TARGET_AML_RBD_TMMCPM_AML.only_forNMF.RDS")
+```
+
+```{r}
+CPM.aml <- CPM.all[rownames(CPM.all) %in% lncRNAs$gene_id,] #lncRNAs only 
+log2.CPM.aml <- log2(CPM.aml+1)
+
+head(CPM.aml[,1:5]) 
+dim(CPM.aml) #5820 1394
+# dim(log2.CPM.aml)
+# table(log2.CPM.aml < 0)
+```
+
+
+#Create Summarized Experiment Object
+
+```{r message=FALSE}
+# library(SummarizedExperiment)
+```
+
+```{r eval=FALSE}
+clinData <- merged %>% 
+  filter(USI %in% colnames(CPM.aml)) %>% 
+  select(USI,Cytogenetic.Category.1,Rare.Fusions,SNVs,
+         Age.Category,Cytogenetic.Category.2) %>% 
+  add_row(USI=setdiff(colnames(CPM.aml), .$USI)) %>%
+  mutate(USI=USI[match(colnames(CPM.aml), USI)]) %>% ##order required....dumb
+  #THis is NOT accurate - need to fill in these patients fusions from fusion call master file!!!
+  mutate_at(vars(Cytogenetic.Category.1:Cytogenetic.Category.2),
+            ~ifelse(is.na(.), "Unknown",.)) %>% 
+  set_rownames(.$USI) %>% 
+  AnnotatedDataFrame()
+
+dim(clinData)
+# head(clinData)
+# tail(clinData)
+identical(clinData$USI, colnames(CPM.aml))
+
+feats <- lncRNAs %>% 
+  filter(gene_id %in% rownames(CPM.aml)) %>% 
+  mutate(gene_id=gene_id[match(rownames(CPM.aml), gene_id)]) %>% #order required....dumb
+  set_rownames(.$gene_id) %>% 
+  AnnotatedDataFrame()
+
+dim(feats)
+head(feats)
+identical(rownames(CPM.aml),feats$gene_id)
+```
+
+```{r, eval=FALSE}
+se <- ExpressionSet(assayData = log2.CPM.aml, 
+                    phenoData = clinData,
+                    featureData = feats) #all lncRNAs with 1 CPM >= 1394*0.05
+
+se
+
+# saveRDS(se,"NMF/TARGET_AML_RBD_log2TMMCPM_AML.only_lncRNAs_forNMF_SummarizedExperiment.RDS")
+```
+
+```{r message=FALSE}
+se <- readRDS("NMF/TARGET_AML_RBD_log2TMMCPM_AML.only_lncRNAs_forNMF_SummarizedExperiment.RDS")
+
+se
+```
+
+
+```{r}
+# extractor functions. pData(), fData(), exprs()
+# featureData(se)@data
+# phenoData(se)@data
+# head(exprs(se)[,1:5])
+```
+
+
+# Feature Filtering/Selection
+
+###DEGs Results 
+
+```{r}
+DEGs.NBM <- read.csv("DEGs/AMLvsNBM_lncRNA_DEGs.csv")
+
+dim(DEGs.NBM) #1325   10
+```
+
+```{r}
+DEGs.NBM.lncs <- DEGs.NBM %>% 
+  filter(gene %in% featureNames(se))  %>% 
+  filter(adj.P.Val < 0.001)
+
+
+quantile(DEGs.NBM.lncs$logFC) 
+dim(DEGs.NBM.lncs)#849  10
+```
+
+```{r}
+se.nbm <- se[DEGs.NBM.lncs$gene]
+se.nbm
+```
+
+
+###Non-Specific Filtering
+
+```{r}
+# calculate the variance for each gene
+rv <- rowVars(exprs(se)) %>% 
+  set_names(., rownames(se))
+
+# select the ntop genes by variance
+select <- order(rv, decreasing=TRUE)[seq_len(min(1000, length(rv)))]
+
+head(rv[select])
+
+#Subset the expression set 
+se.rv <- se[select]
+# se.rv
+```
+
+```{r}
+idx <- which(rowMeans2(exprs(se)) >= 1) #at least mean of 2CPM per gene for expression cut-off
+#2967 lncRNAs/5820 meet this criteria in idx
+
+means <- rowMeans2(exprs(se)[idx,])
+sd <- rowSds(exprs(se)[idx,])
+cv <- sd/means*100
+
+#Select the top 1000 most varied by CV
+sel.cv <- order(cv,decreasing = TRUE)[seq_len(min(1000, length(cv)))]
+
+#subset the expression set
+se.cv <- se[idx] 
+se.cv <- se.cv[sel.cv]
+se.cv
+```
+
+```{r}
+t <- which(rowMeans2(exprs(se)) > 9) #expression outliers
+fData(se)[featureNames(se)[t],]
+
+# CPM.aml[sel.cv[1:10],1:5]
+quantile(means) #max is 376.189 when filtering for mean < 1000 CPM
+# rownames(CPM.aml)[idx[300]]
+plot(sd,means)
+```
+
+
+##Histogram Expression
+
+```{r fig.height=6, fig.width=10}
+par(mfrow=c(2,2))
+
+#I am wondering if the bad results had to do with A) non-log transform (eg expression outliers) and B) the increased sparsity from non-log transformed.
+hist(exprs(se),breaks = seq(0,25,by=0.05))
+hist(exprs(se.cv), breaks = seq(0,25,by=0.05)) #cv has the least "sparse" data - the fewest genes with 0 TPM counts (of course)
+hist(exprs(se.rv), breaks = seq(0,25,by=0.05))
+hist(exprs(se.nbm), breaks = seq(0,25,by=0.05))
+```
+
+
+# NMF Clustering 
+
+n x p nonnegative matitrix where Xij >= 0, termed "X"
+factorization rank r is chosen where r << min(n,p)
+*Objective:* split the information contained in the n x p matrix into distinct r factors: the columns of the matrix. find X = WH
+
+The matrix W is the basis matrix, whose columns are the basis components
+The matrix H is the mixture coefficient or weight matrix, whose columns contain the contribution of each basis
+component to the corresponding column of X
+rows of H are the basis profiles.
+
+*basic usage*
+nmf(x,rank,method,seed)
+x = target matrix, data frame or expressionSet
+rank = factorization rank (# of cols in output matrix, the clusters)
+method = algorithm
+seed = which method to identify the starting point
+
+
+```{r message=FALSE}
+#NOTE: You must unload summarized experiment to load NMF package after or all the errors
+# detach("package:SummarizedExperiment",unload = TRUE)
+library(NMF)
+library(Biobase)
+library(foreach)
+library(doParallel)
+library(synchronicity)
+```
+
+```{r}
+#Nonnegative matrix factorization 
+
+#E. Lim used default brunet algorithm
+#Based on Kullback-Leibler divergence
+nmfAlgorithm() #try pe-nmf as well
+
+#available seeding methods
+#random requires multiple runs to acheive stability- see nrun parameter if want to use that seed method
+#https://www.slideshare.net/DaichiKitamura/efficient-initialization-for-nonnegative-matrix-factorization-based-on-nonnegative-independent-component-analysis
+#ICA (nonnegative) has been designed for this initialization and it NOT orthogonal(like PCA),so it offers more robust initialization value. 
+nmfSeed()  
+nmf.getOption('shared.memory')
+```
+
+```{r eval=FALSE}
+#run nmf
+#If rank is a numeric vector with more than one element, e.g. a range of ranks, then nmf performs the estimation procedure described in nmfEstimateRank.
+
+res <- nmf(se.cv, #top 1000 varied lncs by CV
+           rank=2:15,
+           method="brunet",
+           seed="ica", #ICA derived seed
+           nrun=200,
+           .options="p4v3t",
+           .pbackend=4) 
+# saveRDS(res,"TARGET_AML.Only_lncRNA_NMF_seedICA_nrun200_1000CV_log2CPM_Results.RDS")
+
+res.2 <- nmf(se.cv, #top 1000 varied lncs by CV
+           rank=2:15,
+           method="brunet",
+           seed=2019, #random Seed
+           nrun=200,
+           .options="p4v3t",
+           .pbackend=4)
+# saveRDS(res.2, "TARGET_AML.only_lncRNA_NMF_seed2019_nrun200_1000CV_log2CPM_Results.RDS")
+
+
+res.3 <- nmf(se.cv, #top 1000 varied lncs by CV
+           rank=2:10,
+           method="brunet",
+           seed='nndsvd', #NNDSVD derived seed
+           nrun=200,
+           .options="p4v3t",
+           .pbackend=4) 
+saveRDS(res.3, "TARGET_AML.only_lncRNA_NMF_seedNNDSVD_nrun200_1000CV_log2CPM_Results.RDS")
+
+res.4 <- nmf(se.rv, 
+              rank=2:15,
+              method="brunet",
+              seed=2019,
+              nrun=200,
+              .options="p4v3t",
+              .pbackend=4)
+saveRDS(res.4, "TARGET_AML.only_lncRNA_NMF_seed2019_nrun200_1000RV_log2CPM_Results.RDS")
+        
+res.5 <- nmf(se.nbm, #DE in AML vs NBM, 1 CPM > 5% AML patients, FDR < 0.001
+           rank=2:15,
+           method="brunet",
+           seed=2019,
+           nrun=200,
+           .options="p2v3t",
+           .pbackend=2)
+# saveRDS(res.5, "TARGET_AML.only_lncRNA_NMF_seed2019_nrun200_DeNBM_log2CPM_Results.RDS")
+```
+
+```{r}
+#absolutely terrible. Like 95% of 1394 patients were placed into a single cluster????
+# res <- readRDS("NMF/TARGET_AML.Only_lncRNA_NMF_seedICA_nrun150_Results.RDS")
+# res <- readRDS("NMF/TARGET_AML.only_lncRNA_AMLvsNBM_DEGS_NMF_seed2019_nrun200_Results.RDS")
+# res <- readRDS("NMF/TARGET_AML.Only_lncRNA_NMF_seedICA_nrun200_1000CV_log2CPM_Results.RDS")
+```
+
+
+```{r}
+options(scipen=999)
+
+purity.entropy <- summary(res,class=se$Cytogenetic.Category.1)
+
+purity.entropy %>%
+  arrange(desc(cophenetic)) %>%
+  head(., n=5)
+
+quantile(purity.entropy$purity)
+```
+
+
+
+*Selection Criteria*
+
+Several approaches have then been proposed to choose the optimal value of r. For example,
+(Brunet2004) proposed to take the first value of r for which the cophenetic coefficient starts decreasing, (Hutchins2008) suggested to choose the first value where the RSS curve presents an inflection point, and (Frigyesi2008) considered the smallest value at which the decrease in the RSS is lower than the decrease of the RSS obtained from random data.
+
+```{r eval=FALSE}
+# shuffle original data
+V.random <- randomize(se)
+# estimate quality measures from the shuffled data (use default NMF algorithm)
+estim.r.random <- nmf(V.random,
+                      2:10,
+                      nrun=1, 
+                      seed='nndsvd',
+                      method="brunet",
+                      .options="p4v1t",
+                      .pbackend=4)
+
+# saveRDS(estim.r.random, "TARGET_AML_Randomize_seedICA_nrun200_NMF.RDS")
+
+# plot measures on same graph
+# plot(res, estim.r.random)
+```
+
+```{r}
+# By default, the returned object only contains the best fit over all the runs. That is the
+# factorization that achieved the lowest approximation error (i.e. the lowest objective value).
+
+#Can select by highest Cophentic Score and high silhoutte
+res$measures %>%
+  arrange(desc(cophenetic))
+```
+
+```{r}
+plot(res)
+```
+
+```{r}
+annColors <- colorCodes_aheatmap(df=pData(se)[2:5]) 
+annColors[["consensus"]] <- c(1:15)
+# annColors
+```
+
+```{r fig.height=12, fig.width=18}
+par(mfrow=c(1,2))
+consensusmap(res$fit$`4`,annCol=pData(se)[2:5], annColors=annColors) 
+consensusmap(res$fit$`6`,annCol=pData(se)[2:5], annColors=annColors)
+```
+
+
+basis - is the metagenes matrix
+coef - is the mixture coefficient matrix (metagene expression profile)
+
+```{r}
+options(scipen = 999,digits = 3)
+summary(res$fit$`4`, class=se$Rare.Fusions)
+```
+
+
+```{r}
+w <- basis(res$fit$`4`)
+dim(w)
+head(w)
+```
+
+```{r}
+basismap(res$fit$`4`)
+```
+
+```{r}
+options(scipen = 999,digits = 3)
+h <- coef(res$fit$`4`)
+
+dim(h)
+# head(h)
+```
+
+```{r}
+coefmap(res$fit$`4`, annCol=pData(se)[,2:4], 
+        annColors=annColors)
+```
+
+```{r}
+# only compute the scores
+s <- featureScore(res$fit$`3`)
+# head(s)
+ 
+# compute the scores and characterize each metagene
+idx.feat <- extractFeatures(res$fit$`4`, 10, format='combine')
+# idx.feat
+
+topFeatures <- w[idx.feat,] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Feature") %>% 
+  inner_join(.,fData(se), by=c("Feature"="gene_id"))
+
+head(topFeatures)
+dim(topFeatures)
+```
+
+```{r}
+sample.clust <- predict(res$fit$`4`,"samples")
+head(sample.clust)
+
+table(sample.clust)
+se$cluster <- sample.clust
+```
+
+
+
+#Set-up Data and Factor Levels
+
+Methods to Select the Features to Include 
+
+1. non-specific filtering - remove low counts 
+ *done for all the input expression matrices 
+ 
+2. Measures of variance
+  * Could use var() and rank highest to lowest
+  * Could use coefficient of variation 
+  * still need to rank them - so like top 75th percentile of variance or CV 
+  
+Methods for Data Transformation 
+1. Log2 transformation of TPMs 
+2.  VST/rlog with DESeq2
+
+
+practice <- read_csv(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_DxSamples_dupGenesRemoved_TPM_Aug2014.csv"))
+practice <- column_to_rownames(practice,)
+rownames(practice) <- gsub("-", "\\.", rownames(practice))
+colnames(practice) <- str_split_fixed(colnames(practice), "\\.", 5)[,3]
+
+
+head(practice[,1:5])
+
+
+
+
+LD <- readRDS("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/level3/transcript/concat_matrices/2017July_BCCA_1031_Kallisto_GRCh38_Illumina_data/TARGET_AML_PolyA_Kallisto_Quant_GeneLevel_TPM.RDS")
+
+head(LD[,1:5])
+dim(LD)
+
+```{r}
+#filter low count genes
+ #use 2% as the lower limit of samples considering that many rare fusions are in this range
+keep <- rowSums(practice >= 1) >= 0.02*ncol(practice)
+df <- t(practice[keep,])
+
+#filter for CV
+cv <- apply(df,2, sd)/ apply(df,2, mean)*100
+keep2 <- cv >= quantile(cv)[4] #75th percentile of CV
+df <- df[,keep2]
+
+
+#log2 transform (try VST?)
+df <- log2(df+1)
+
+head(df[,1:5])
+dim(df) #160 5245
+
+hist(df)
+```
+
+```{r}
+pheno <- merged[rownames(df),"Cytogenetic.Category.1"] %>% set_names(rownames(df))
+table(pheno, useNA = "always")
+```
+
+
+##Low Depth RNAseq Kallisto 
+
+```{r}
+keep <- rowSums(LD >= 1) >= 0.02*ncol(LD)
+df.LD <- t(LD[keep,])
+
+#filter for CV
+cv <- apply(df.LD,2, sd)/ apply(df.LD,2, mean)*100
+keep2 <- cv >= quantile(cv)[4] #75th percentile of CV
+df.LD <- df.LD[,keep2]
+
+
+#log2 transform (try VST?)
+df.LD <- log2(df.LD+1)
+
+head(df.LD[,1:5])
+dim(df.LD) #487 6831
+
+hist(df.LD)
+```
+
+```{r}
+LD.pheno <- merged[intersect(colnames(LD), rownames(merged)), "Cytogenetic.Category.1"]  %>% 
+  set_names(intersect(colnames(LD), rownames(merged)))
+
+n <- setdiff(colnames(LD), rownames(merged))
+p <- ifelse(grepl("^BM", n), "NBM", "Unknown") %>% set_names(n)
+
+LD.pheno <- c(LD.pheno, p)
+
+table(LD.pheno, useNA = "always")
+```
+
+
+
+Options for unsupervised clustering are 
+1. UMAP (not sure if good for biological meaning/...)
+2. NMF 
+3. Unsupervised Random Forest. 
+
+
+#Random Forest
+
+```{r}
+library(randomForest)
+# options(expressions = 5e5)
+```
+
+
+### Using synthetic sample data 
+
+
+```{r}
+#Synthetic dataset
+set.seed(426)
+syn <- apply(df,1, function(x) sample(x = x, size = length(x), replace = TRUE)) %>%
+  t() %>%
+  set_colnames(colnames(df)) %>%
+  set_rownames(paste0("Syn.Sample.",1:160))
+
+head(syn[,1:5])
+dim(syn)
+```
+
+
+```{r}
+full.df <- rbind(df, syn) %>% 
+  as.data.frame() 
+full.df$Class <-  as.factor(ifelse(grepl("Syn", rownames(full.df)), 2, 1))
+
+
+head(full.df[,1:5])
+dim(full.df)
+
+table(full.df$Class)
+```
+
+```{r}
+#Using synthesic data
+rfuA <- randomForest(Class ~ ., 
+                   data=full.df,
+                   ntree = 500,
+                   importance= TRUE,
+                   proximity=TRUE,
+                   do.trace=FALSE)
+```
+
+```{r}
+MDSplot(rfuA, as.factor(c(pheno, rep("Syn", 160))), k=3)
+```
+
+```{r}
+options(scipen=999)
+# The output of cmdscale on 1 - rf$proximity is returned invisibly.
+prox <- rfuA$proximity[!grepl("Syn.", rownames(rfuA$proximity)),!grepl("Syn.", rownames(rfuA$proximity))]
+mds.aml <- cmdscale(d=1-prox, k=3, eig=TRUE)
+
+plot(mds.aml$points[,1], mds.aml$points[,2], col=as.numeric(as.factor(pheno)))
+# text(mds.aml$points[,1], mds.aml$points[,2]-0.01, rownames(mds.aml$points),cex=0.7)
+plot(mds.aml$points[,1], mds.aml$points[,3], col=as.numeric(as.factor(pheno)))
+```
+
+```{r}
+rfuA$importance %>% 
+  as.data.frame() %>%
+  rownames_to_column("Gene") %>% 
+  arrange(desc(abs(MeanDecreaseAccuracy))) %>% 
+  head(n=50)
+# dim(rfuA$importance)
+```
+
+https://cran.r-project.org/web/packages/randomForest/randomForest.pdf
+
+
+### Using unsupervised mode RF
+
+strata
+sampsize
+
+
+```{r}
+#unsupervised without synthesic data
+rfuB <- randomForest(x=df,y=NULL, 
+                   nodesize=1,
+                   sampsize = 159, #LOO???
+                   # data=full.df,
+                   # mtry=72, #want fewer variables ???
+                   replace=FALSE, #definitly use replace = FALSE
+                   ntree = 2500, #many trees to improve classification
+                   importance= TRUE, 
+                   proximity=TRUE, 
+                   do.trace=FALSE)
+```
+
+```{r}
+rfuB
+varImpPlot(rfuB, cex=0.7)
+```
+
+```{r}
+hclust.rf <- hclust(as.dist(1-rfuB$proximity), method = "ward.D2")
+
+
+len <- 299
+col <- colorRampPalette(c("white","red1", "red2", "red3", "red4"))(n=len) #"deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1"
+
+pheatmap(mat=t(df),
+         color=col,
+         cluster_cols = hclust.rf, 
+         cluster_rows=TRUE, 
+         clustering_method ="ward.D2",
+         scale="none", 
+         annotation_col = as.data.frame(pheno))
+
+```
+
+```{r}
+MDSplot(rfuB, as.factor(pheno))
+# barplot(rep(1,6), col=brewer.pal(6, "Set1"))
+# table(pheno)
+```
+
+inv.16.     MLL  Normal   Other t.8.21. Unknown 
+     33      34      28      33      26       6 
+
+```{r}
+#unsupervised without synthesic data
+rfuC <- randomForest(x=df.LD,y=NULL, 
+                   # data=d,
+                   ntree = 2000,
+                   importance= TRUE, 
+                   proximity=TRUE, 
+                   do.trace=FALSE)
+```
+
+```{r}
+rfuC
+```
+
+```{r}
+MDSplot(rfuC, as.factor(pheno))
+```
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
