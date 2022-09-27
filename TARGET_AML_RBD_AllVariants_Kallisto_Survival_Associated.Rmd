@@ -946,8 +946,8 @@ dim(polyA.CPM.lnc) #26157   315
 ```{r}
 Targets <- DE$DE %>% 
   mutate(Comparison="AMLvsNBM") %>%
-  filter(grepl("^ENSG", gene_id)) %>%
-  filter(gene_id %in% rownames(CPM.lnc))#remove Transposable elements
+  filter(grepl("^ENSG", gene_id)) %>% #remove Transposable elements
+  filter(gene_id %in% rownames(CPM.lnc))
   
 
 dim(Targets) #1588   34
