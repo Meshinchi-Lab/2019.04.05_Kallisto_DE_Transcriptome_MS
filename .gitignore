@@ -9,3 +9,5 @@ data/
 figures/
 DEGs/
 seeds*
+core
+glmnet*.gz

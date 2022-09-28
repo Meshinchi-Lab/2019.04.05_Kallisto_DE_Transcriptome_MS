@@ -45,9 +45,9 @@ library(ggplot2)
 ```
 
 ```{r}
-# source(file.path(SCRIPTS, "survival_analysis/Survplot_Functions_2018.10.24.r"))
+# install.packages("glmnet_3.0.tar.gz", repos=NULL, type='source', 
+#                  lib="/home/jlsmith3/R/x86_64-pc-linux-gnu-library/")
 ```
-
 
 # Define Functions
 
@@ -168,7 +168,7 @@ cox_glmnet_workflow <- function(CDE.train,targets,IDmap,
                                 CDE.validation1=NULL,
                                 CDE.validation2=NULL){
   
-  suppressPackageStartupMessages(library(glmnet))
+  suppressPackageStartupMessages(library(glmnet,lib.loc = "/home/jlsmith3/R/x86_64-pc-linux-gnu-library"))
   #CDE.train has  patients as rows, surivival data and all genes expression values as columns.
   #targets is a character vector with the column names of the genes of interest that will be included in the glmnet fit. 
   #lncRNAs is IDmap for ENSG lncRNA IDs to gene name with biotype. 
@@ -679,7 +679,13 @@ risk.table <- function(survFit.obj, f.levels=NULL,
 # Read in the Clincal Data
 
 ```{r}
-FASTDRIVE <- "/Users/jsmi26/fast_drive" #/fh/fast/meshinchi_s on the Fred Hutch HPC
+host <- Sys.info()[["nodename"]]
+if(grepl("gizmo", host)){
+  FASTDRIVE <- "/fh/fast/meshinchi_s"
+}else{
+  FASTDRIVE <- "/Users/jsmi26/fast_drive" #/fh/fast/meshinchi_s on the Fred Hutch HPC
+}
+
 RPROJ <- list(PROJHOME=normalizePath(file.path(FASTDRIVE,"workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/")),
               CDE=normalizePath(file.path(FASTDRIVE, "workingDir/TARGET/AML_TARGET/Clinical/CDE/")),
               GENREFS=normalizePath(file.path(FASTDRIVE, "workingDir/TARGET/Reference_Data/")),
@@ -706,16 +712,19 @@ head(CDE)
 dim(CDE) #1298   16
 ```
 
+```{r}
+table(CDE$Set)
+```
+
 # Read in the counts
 
 ```{r}
-RBD <- readRDS(file.path("data/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+RBD <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
 rownames(RBD) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD))
 
 head(RBD[,1:5])
 dim(RBD) #59853  1462
 ```
-
 
 # Read in the Gene Annotations
 
@@ -769,6 +778,9 @@ dim(DE$Voom$E) #31406   848
 dim(DE$DE) #1348    9
 table(DE$DE$logFC > 1) #648 upreg
 table(rownames(DE$Voom$E) %in% lncRNAs$gene_id) #7635 lncRNAs
+
+# saveRDS(DE,file.path(PROJHOME,"Survival/Retrain/AML_vs_NBM_training_set_limma_DE.RDS"))
+# write.csv(DE$DE, file.path(PROJHOME,"Survival/Retrain/AML_vs_NBM_training_set_limma_DEGs.csv"), row.names = F)
 ```
 
 
@@ -785,9 +797,40 @@ table(DE$DE$gene_id %in% old$gene_id)
 ```
 
 ```{r}
-old_lncScore <- readRDS(file.path(PROJHOME, "Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS"))
+old_lncScore <- readRDS(file.path(PROJHOME, "Survival/00_Archive/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_7.15.19.RDS"))
 
-table(DE$DE$gene_id %in% old_lncScore$nonZero.train.coef$gene) #OK
+# table(DE$DE$gene_id %in% old_lncScore$nonZero.train.coef$gene) #OK
+# names(old_lncScore)
+dim(old_lncScore$Model.Comparison.df)
+
+head(old_lncScore$Model.Comparison.df)
+# table(old_lncScore$Model.Comparison.df$Set)
+```
+
+```{r}
+old_CDE <- read.csv(file.path(PROJHOME,"Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_CDE_7.17.19.csv")) %>% 
+  filter(Set != "Validation2") %>% 
+  select(USI, matches("EFS.time|OS.time|Event|OS", ignore.case = FALSE)) %>% 
+  rename_at(vars(First.Event:OS.ID), ~paste0(.,"_Original"))
+
+# dim(old_CDE) #1300    7
+
+new_CDE <- CDE %>% 
+  select(USI, matches("EFS.time|OS.time|[Ee]vent|OS", ignore.case = FALSE)) %>% 
+  rename_at(vars(EFS.time..days.:OS.ID), ~paste0(.,"_Retrain"))
+# dim(new_CDE) #1298    7
+
+compare <- old_CDE %>% 
+  left_join(., new_CDE, by="USI") %>% 
+  select(colnames(.)[order(colnames(.))]) %>% 
+  select(USI, everything()) %>% 
+  mutate(comp_EFS=EFS.time..days._Original==EFS.time..days._Retrain,
+         comp_Event.ID=Event.ID_Original==Event.ID_Retrain)
+
+
+# compare
+table(compare$comp_EFS, useNA = 'always')
+table(compare$comp_Event.ID, useNA = 'always')
 ```
 
 ```{r}
@@ -812,7 +855,6 @@ The TMM method implements the trimmed mean of M-values proposed by Robinson and 
 sets <- unique(CDE$Set)
 ```
 
-
 ```{r}
 #start with the expressed genes from the training set 
 genes <- unique(rownames(DE$Voom$E))
@@ -834,7 +876,7 @@ table(incl %in% old_lncScore$nonZero.train.coef$gene) # all 37 model lncs are fo
 ```
 
 ```{r}
-save=TRUE
+save=FALSE
 cohorts <- purrr::map(sets,function(set){
   CDE.sub <- CDE[CDE$Set == set,]
   RBD.sub <- RBD.lnc[,CDE.sub$USI]
@@ -846,7 +888,7 @@ cohorts <- purrr::map(sets,function(set){
                  log=TRUE,
                  prior.count = 0.5)
   if(save){
-      write.csv(CPM.lnc,file=paste0("data/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_",set,"_TMMCPM.csv"))
+      write.csv(CPM.lnc,file=file.path(PROJHOME, paste0("Survival/Retrain/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_",set,"_TMMCPM.csv")))
   }
 
   targets <- DE$DE %>%
@@ -1009,9 +1051,9 @@ uv_upreg_0.1 <- cox_glmnet_workflow(CDE.train = cohorts$Train,
 ```
 
 ```{r}
-# dim(uv_upreg_0.1$nonZero.train.coef) #47  4
+dim(uv_upreg_0.1$nonZero.train.coef) #47  4
 # head(uv_upreg_0.1$nonZero.train.coef)
-saveRDS(uv_upreg_0.1,)
+# saveRDS(uv_upreg_0.1,file.path(PROJHOME,"Survival/Retrain/retrained.RDS"))
 ```
 
 ```{r}

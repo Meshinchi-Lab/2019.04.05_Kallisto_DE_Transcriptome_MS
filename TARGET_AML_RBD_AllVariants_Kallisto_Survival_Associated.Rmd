@@ -5,7 +5,6 @@ date: "April 16, 2019"
 output: html_document
 ---
 
-
 #Set-Up
 
 ```{r setup}
@@ -40,7 +39,7 @@ library(survival)
 # library(gtools)
 library(gridExtra)
 library(GGally)
-library(DeGSEA)
+
 
 
 getwd()
@@ -164,13 +163,13 @@ plots <- function(Model.Comparison.df, Gene.Col,log=FALSE, type="wfall"){
 
 ```{r}
 cox_glmnet_workflow <- function(CDE.train,targets,
-                                IDmap,sig.mres,
+                                IDmap,
                                 std=FALSE,N.Groups=5,oneSE=FALSE,
                                 CDE.test,
                                 CDE.validation=NULL,
                                 CDE.validation2=NULL){
   
-  suppressPackageStartupMessages(library(glmnet))
+  suppressPackageStartupMessages(library(glmnet, lib.loc = "/home/jlsmith3/R/x86_64-pc-linux-gnu-library/"))
   #CDE.train has  patients as rows, surivival data and all genes expression values as columns.
   #targets is a character vector with the column names of the genes of interest that will be included in the glmnet fit. 
   #lncRNAs is IDmap for ENSG lncRNA IDs to gene name with biotype. 
@@ -251,9 +250,7 @@ cox_glmnet_workflow <- function(CDE.train,targets,
       coef.trainingMod <- predict(mod, type="coefficients", s=lambda)
       nonZero.train <- sparsemat_to_df(coef.trainingMod) %>% 
         arrange(desc(coef)) %>% 
-        left_join(., IDmap, by=c("gene"="gene_id")) %>% 
-        left_join(., select(sig.mres, Variable, Hazard.Ratio, P.Value),
-                  by=c("gene"="Variable"))
+        left_join(., IDmap, by=c("gene"="gene_id")) 
       
       ## Testing 
       x.test <- CDE.test %>% 
@@ -286,7 +283,7 @@ cox_glmnet_workflow <- function(CDE.train,targets,
       N=N.Groups
       perc.labs <- function(N){paste0("q",1:N)}
       e <- try(group_by(Model.Comparison.df, Set) %>% 
-                  mutate(TEST=quantcut(lnc.Score, q=N, na.rm=FALSE, labels=perc.labs(N))), 
+                  mutate(TEST=gtools::quantcut(lnc.Score, q=N, na.rm=FALSE, labels=perc.labs(N))), 
                silent = TRUE)
       if(inherits(e,"try-error")){N=3}
     
@@ -296,7 +293,7 @@ cox_glmnet_workflow <- function(CDE.train,targets,
         group_by(Set) %>% 
         mutate(lnc.Median.Groups=factor(ifelse(lnc.Score >= median(lnc.Score), "high", "low"),
                                         levels=c("low", "high")), 
-               lnc.Percentile.Groups=as.factor(quantcut(lnc.Score, q=N, na.rm=FALSE, 
+               lnc.Percentile.Groups=as.factor(gtools::quantcut(lnc.Score, q=N, na.rm=FALSE, 
                                                         labels=perc.labs(N)))) %>%
         arrange(desc(lnc.Score)) %>%
         ungroup() %>% 
@@ -422,19 +419,15 @@ xtile <- function(names,exp_vals,sdfp,survival_type){
 # Read in the Clinical Data
 
 ```{r}
-cols_for_supp <- read.csv(file.path(substr(CDE,1,nchar(CDE)-3), "metadata/TARGET_AML_Clinical_Columns_for_Analysis_7.24.20.csv"))
+merged <- read.csv("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_CDE_7.17.19.csv")
 
-merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
-                   row.names = 1, na.strings = c("N/A","NA","#N/A","^\\.$", "^$"))
-
-
-merged <- merged %>%
+CDE.survdat <- merged %>%
   filter(!is.na(USI), !grepl("Unknown", USI)) %>%
   filter(!is.na(EFS.time..days.)) %>%
   set_rownames(.$USI)
 
 head(merged[,1:5])
-dim(merged) #2181  149
+dim(merged) 
 ```
 
 ```{r eval=TRUE}
@@ -451,26 +444,15 @@ head(manifest)
 ```
 
 
-# Read in the counts
+# Read in the Counts
 
-```{r eval=FALSE}
+```{r}
 RBD <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
 rownames(RBD) <- gsub("\\.[0-9]{1,}$", "", rownames(RBD))
 
 head(RBD[,1:5])
 dim(RBD) #59853  1462
 ```
-
-```{r eval=FALSE}
-polyA <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_polyA_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
-rownames(polyA) <- gsub("\\.[0-9]{1,}$", "", rownames(polyA))
-polyA <- polyA[,setdiff(colnames(polyA), colnames(RBD))] #no duplicates
-polyA <- polyA[,intersect(colnames(polyA), merged$USI)] #requires EFS/OS data
-
-# head(polyA[,1:5])
-dim(polyA) #59853   315
-```
-
 
 # Read in the Gene Annotations
 
@@ -489,242 +471,7 @@ lncRNAs <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29.ln
 dim(lncRNAs)
 ```
 
-```{r}
-LSC17 <- read.csv(file.path(PROJHOME,"2017.02.28_LSC17_Score/LSC17_Genes_Coeff.csv")) %>% 
-  mutate(LSC_alias=case_when(
-    LSC_genes =="KIAA0125" ~ "FAM30A", 
-    LSC_genes == "NGFRAP1" ~ "BEX3", 
-    LSC_genes == "GPR56" ~ "ADGRG1", 
-    TRUE ~ LSC_alias)) %>% 
-  left_join(., select(IDmap,gene_id, gene_name),
-            by=c("LSC_genes"="gene_name")) %>% 
-  left_join(., select(IDmap,gene_id, gene_name),
-            by=c("LSC_alias"="gene_name")) %>% 
-  mutate(gene_id=ifelse(is.na(gene_id.x), gene_id.y, gene_id.x)) %>% 
-  select(-matches("\\.x|\\.y"))
-  # filter(is.na(gene_id))
-
-# LSC17
-# write.csv(LSC17,"~/RNA_seq_Analysis/2017.02.28_LSC17_Score/LSC17_Genes_Coeff_update.csv")
-```
-
-Alias: 
-
-FAM30A == KIAA0125
-BEX3 == NGFRAP1
-ADGRG1== GPR56
-
-
-# Combine CDE 0531 and 1031
-
-```{r warning=FALSE}
-CDE.survdat <- read.csv("Survival/00_Archive/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_CDE_8.02.19.csv") %>%
-  select(USI,matches("^ENSG|LSC17.Score|LSC\\.|lnc\\.|Set|log10.WBC")) %>%
-  left_join(.,select(merged,USI,
-                     ISCN,
-                     Eligibility,Eligibility_Comments,
-                     Primary.CNV,
-                     Primary.Fusion,
-                     Additional.Fusions.CNV,
-                     ETS_Fusion,
-                     FLT3.ITD.allelic.ratio,
-                     Cyto.Fusion.Molecular.Risk_update,
-                     everything()),
-            by="USI")  %>% 
-  #Fix the final.risk.group 
-  mutate_at(vars(Final.Risk.Group),~case_when(
-    Cyto.Fusion.Molecular.Risk_update=="Standard" & MRD.at.end.of.course.1=="Unknown" ~ "Unknown",
-    TRUE ~ .
-  )) %>% 
-  #Jason wants this patient to remain High due to not beign in CR1 despite it not fitting the definition we laid out
-  mutate_at(vars(Final.Risk.Group),~case_when(
-    USI=="PAWAIG" ~ "High",
-    TRUE ~ .  )) %>% 
-  
-    #Create an integrated risk group with lncRNA and cyto/mol
-    mutate(lncRNA_plus_CM_Risk=factor(case_when(
-              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "High" ~ "Standard",
-              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ "Low",
-              TRUE ~ Cyto.Fusion.Molecular.Risk_update), 
-      levels = c("Standard","High", "Low"))) %>% 
-    
-    mutate(lncRNA_plus_CM_Risk_basedonEFS=factor(case_when(
-              lnc.Pos.Neg == "Neg" & Cyto.Fusion.Molecular.Risk_update == "High" ~ "Standard",
-              lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Standard" ~ "High",
-              TRUE ~ Cyto.Fusion.Molecular.Risk_update), 
-      levels = c("Standard","High", "Low"))) %>% 
-  
-    mutate(lncRNA_plus_CM_Risk_2Groups=factor(case_when(
-              lnc.Pos.Neg == "Pos" & Cyto.Fusion.Molecular.Risk_update == "Low" ~ "Neg",
-              TRUE ~ lnc.Pos.Neg), 
-      levels = c("Neg","Pos"))) %>% 
-  
-    mutate(Cyto.Fusion.Molecular.Risk_update = factor(Cyto.Fusion.Molecular.Risk_update, 
-                                              levels=c("Standard","High","Low")))
-
-
-#Set factor levels and fix error  
-CDE.survdat <- CDE.survdat %>%
-  
-  mutate_at(vars(Set), 
-            ~factor(gsub("Test","Validation1",gsub("^Validation$","Validation2", .)),
-                    levels=c("Train","Validation1","Validation2"))) %>% 
-  mutate_at(vars(Cyto.Fusion.Molecular.Risk_update),
-            ~factor(., levels=c("High","Standard","Low"))) %>%
-  mutate_at(vars(matches("LSC\\.[Mq]")),~factor(.,levels=c("low","high"))) %>%
-  mutate_at(vars(matches("LSC\\.Perc")),~factor(.,levels=c("q1","q2",
-                                                           "q3","q4"))) %>%
-  mutate_at(vars(matches("lnc.Pos")), ~factor(., levels=c("Neg","Pos"))) %>% 
-  mutate_at(vars(matches("lnc.Med")), ~factor(.,levels=c("low","high"))) %>%
-  mutate_at(vars(matches("lnc\\.Perc")),~factor(.,levels=c("q1","q2",
-                                                           "q3","q4"))) %>%
-  #this has not been explicitly updated yet 7/24/20 even though Final.Risk.Group has been 
-  mutate_at(vars(lncRNA_plus_CM_Risk),
-            ~factor(., levels=c("Standard","Low","High"))) %>%
-  
-  #Need to re-run this b/c NPM1/CEBPA was swapped
-  mutate(Sequencing_Cohort="RBS", #ORIGINAL CODE for blocked randomization
-         AML="AML",
-         Major.Group_update=case_when(
-                      grepl("CBFA2T3-GLIS2",Primary.Fusion) ~ "CBFA2T3-GLIS2",
-                      grepl("NUP98-NSD1|NSD1-NUP98",Primary.Fusion) ~ "NUP98-NSD1",
-                      grepl("NUP98-KDM5A|KDM5A-NUP98",Primary.Fusion) ~ "NUP98-KDM5A",
-                      grepl("DEK-NUP214", Primary.Fusion) ~ "DEK-NUP214",
-
-                      grepl("RBM15-MKL1",Primary.Fusion) ~ "RBM15-MKL1",
-                      grepl("RUNX1-CBFA2T3",Primary.Fusion) ~ "RUNX1-CBFA2T3", 
-                      grepl("NPM1-MLF1",Primary.Fusion) ~ "NPM1-MLF1", 
-                      
-                      grepl("RUNX1-RUNX1T1", Primary.Fusion) ~ "RUNX1-RUNX1T1",
-                      grepl("CBFB-MYH11", Primary.Fusion) ~ "CBFB-MYH11",
-                      grepl("KMT2A-|-KMT2A", Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV)  ~ "KMT2A",
-
-                      grepl("NUP98",Primary.Fusion) &
-                        !grepl("NUP98-KDM5A|NUP98-NSD1",Primary.Fusion)~ "NUP98-Other",
-                      grepl("MLLT10", Primary.Fusion) & !grepl("KMT2A", Additional.Fusions.CNV) ~ "MLLT10",
-                      grepl("KAT6A", Primary.Fusion) | grepl("KAT6A", Additional.Fusions.CNV) |
-                         grepl("t\\(8;16\\)\\(p11.2;p13.3\\)", ISCN) ~ "KAT6A",
-                      grepl("ETV6", ETS_Fusion) ~ "ETS-ETV6",
-                      grepl("ETS-Other|FUS-ERG", ETS_Fusion) ~ "ETS-Other",
-                    
-
-                      grepl("monosomy7", Primary.CNV)  ~ "monosomy7",
-                      # grepl("del5q", Primary.CNV) ~ "del5q", #only 5 patients, so a little confusing
-                      FLT3.ITD.allelic.ratio > 0.1 ~ "FLT3.ITD",
-                      NPM.mutation. == "Yes" ~ "NPM1",
-                      CEBPA.mutation. == "Yes" ~ "CEBPA",
-                      TRUE ~ "OtherAML")) %>%
-  
-  filter(Eligibility_Comments!= "remove") %>%
-  set_rownames(.$USI) 
-
-
-
-head(CDE.survdat[,1:5])
-dim(CDE.survdat) #1298  223
-
-# write.csv(CDE.survdat, "TARGET_AML_lncRNA_CDEs_09.14.21.csv", row.names = FALSE)
-```
-
-```{r}
-# table(CDE.survdat$ETS_Fusion, useNA='ifany')
-# table(CDE.survdat$Primary.CNV, useNA = 'ifany')
-
-#No real issues with eligibility! whoo!
-CDE.survdat %>% 
-  group_by(Set,Eligibility_Comments) %>%
-  summarise(N=n()) %>% 
-  ungroup() #%>% 
-  # write.csv(., "TARGET_AML_lncRNA_Eligability.csv", row.names = F)
-
-# table(CDE.survdat$Eligibility_Comments) # 2 must be removed 
-# filter(CDE.survdat, Eligibility_Comments=="remove") %>% 
-#   select(USI,Reg., Set, Eligibility, Eligibility_Comments)
-# table(CDE.survdat$Major.Group_update, useNA='ifany')
-# table(CDE.survdat$lncRNA_plus_CM_Risk_basedonEFS)
-
-CDE.survdat %>% 
-  filter(SCT.in.1st.CR != "Unknown") %>% 
-  group_by(Cyto.Fusion.Molecular.Risk_update, SCT.in.1st.CR) %>% 
-  summarise(N=n())
-
-
-CDE.survdat %>% 
-  filter(SCT.in.1st.CR != "Unknown") %>% 
-  group_by(lncRNA_plus_CM_Risk_basedonEFS, SCT.in.1st.CR) %>% 
-  summarise(N=n())
-
-
-CDE.survdat %>% 
-  filter(SCT.in.1st.CR != "Unknown", Cyto.Fusion.Molecular.Risk_update != "Low") %>% 
-  group_by(lnc.Pos.Neg,Cyto.Fusion.Molecular.Risk_update, SCT.in.1st.CR) %>% 
-  summarise(N=n())
-
-```
-
-
-## Supplemental Data for Manuscript
-
-```{r}
-# date="12.11.20"
-date="09.13.21"
-```
-
-```{r}
-Expn_Data_Supp <- CDE.survdat %>% 
-  select(USI,Set,lnc.Pos.Neg,lnc.Score, matches("ENSG")) %>% 
-  select(-all_of(LSC17$gene_id))
-
-
-head(Expn_Data_Supp)
-dim(Expn_Data_Supp) 
-# write.csv(Expn_Data_Supp,
-#           paste0("manuscript/Supplemental_Tables/TARGET_AML_Expn_Data_Supplement",date,".csv"),
-#                  row.names = FALSE)
-```
-
-```{r warning=FALSE}
-CDE_Data_Supp <- CDE.survdat %>% 
-  select(-matches("^ENSG")) %>% 
-  # left_join(., JEFedited, by="USI") %>%
-  arrange(Set) %>%
-  mutate(Major.Group=Major.Group_update,
-         `Cyto/Fusion/Molecular Risk update`=Cyto.Fusion.Molecular.Risk_update) %>% 
-  mutate_all(~as.character(.)) %>% 
-  select(USI,
-         Study=Protocol,
-         Set,
-         `lncScore Group`=lnc.Pos.Neg, 
-         `LSC17 Group`=LSC.Med.Groups_AllPts,
-         `Integrated lncScore CMrisk`=lncRNA_plus_CM_Risk,
-         `Major Group (for stratified randomization)`=Major.Group,
-         `Primary Fusion`=Primary.Fusion,
-         `Primary CNV`=Primary.CNV,
-         `Additional CNV or Fusion`=Additional.Fusions.CNV,
-         # `Cyto vs. Seq`=Cyto.vs..Seq,
-         `Cyto/Fusion/Molecular Risk update`,
-         `Final Risk Group Update`=Final.Risk.Group, 
-         `EFS time (days)`=EFS.time..days.,
-         `OS time (days)`=OS.time..days.,
-         `EFS event type ID`=EFS.event.type.ID,
-         `OS event ID`=OS.event.ID)
-         # `RAM Positive`=RAM.phenotype, 
-          # ISCN)
-
-         # one_of(cols_for_supp$x),
-         # EFS.time..days.,
-         # OS.time..days.,
-         # -Primary.Cytogenetic.Code)
-
-
-head(CDE_Data_Supp)
-dim(CDE_Data_Supp) #1300   56
-
-# xlsx::write.xlsx(CDE_Data_Supp, "manuscript/COG_Requests/TARGET_AML_lncScore_Manuscript_Meshinchi_09.13.21.xlsx")
-# write.csv(CDE_Data_Supp,
-#           paste0("manuscript/Supplemental_Tables/TARGET_AML_CDE_Supplement",date,".csv"),
-#           row.names = F)
-```
+# Train/Test/Val Subset Dataframes
 
 ```{r}
 if(! any(grepl("Set",colnames(CDE.survdat)) )) {
@@ -747,64 +494,6 @@ table(CDE.survdat$Set)
 ```
 
 ```{r}
-CDE.survdat %>% 
-  group_by(Set) %>% 
-  mutate(N=n()) %>% 
-  group_by(Cyto.Fusion.Molecular.Risk_update, .add=TRUE) %>% 
-  summarize(N_RG=n(),
-            Percent=round(N_RG/N[1]*100, digits = 1)) %>% 
-  ungroup() %>% 
-  select(-N_RG) %>%
-  spread(Set, Percent) %>% 
-  rename_at(vars(1), ~gsub("Cyt.+lar.","Cytomolecular ",.)) %>%
-  rename_at(vars(2:4), ~paste(.,"Set")) %>%
-  mutate_at(vars(1), ~paste(.,"Risk")) #%>% 
-  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_Risk.Group_SuppTable_", date, ".csv"), row.names = F)
-```
-
-```{r}
-CDE.survdat %>% 
-  group_by(Set) %>% 
-  mutate(N=n()) %>% 
-  group_by(Protocol, add=TRUE) %>% 
-  summarize(N_PG=n(),
-            Percent=round(N_PG/N[1]*100, digits = 1)) %>% 
-  ungroup() %>% 
-  select(-N_PG)%>%
-  spread(Set, Percent) %>%
-  mutate(Protocol=factor(Protocol,
-                         levels=c("CCG-2961","AAML03P1",
-                                  "AAML0531","AAML1031"))) %>%
-  rename_at(vars(2:4), ~paste(.,"Set")) #%>%
-  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_Protocol_SuppTable_", date, ".csv"), row.names = F)
-
-
-```
-
-```{r}
-# table(CDE.survdat$Set, CDE.survdat$Treatment.Arm)
-Fusion.Group.Frequencies <- CDE.survdat %>% 
-  group_by(Set) %>% 
-  mutate(N=n()) %>% 
-  group_by(Major.Group_update, add=TRUE) %>% 
-  summarize(N_MG=n(),
-            Percent=round(N_MG/N[1]*100, digits = 1)) %>% 
-  ungroup() %>% 
-  select(-N_MG) %>%
-  spread(Set, Percent) %>% 
-  rename_at(vars(Train:Validation2), ~paste(., "Set")) %>%
-  arrange(desc(`Train Set`)) #%>% 
-  # write.csv(.,paste0("manuscript/Supplemental_Tables/lncRNA_FusionGroup__SuppTable_", date, ".csv"), row.names = F)
-
-
-head(Fusion.Group.Frequencies)
-dim(Fusion.Group.Frequencies)
-```
-
-
-## Train/Test/Val Subset Dataframes
-
-```{r}
 CDE.train <- CDE.survdat[CDE.survdat$Set == "Train",]
 
 table(CDE.train$Final.Risk.Group)
@@ -823,11 +512,6 @@ CDE.validation <- CDE.survdat[CDE.survdat$Set == "Validation",]
   
 table(CDE.validation$Final.Risk.Group)
 table(CDE.validation$Treatment.Arm)
-```
-
-```{r}
-CDE.validation2 <- CDE.0531.subset[CDE.0531.subset$Sequencing_Cohort == "PolyA",]
-CDE.validation2$Set <- "Validation2"
 ```
 
 
@@ -852,21 +536,12 @@ DE <- voom_DE(expnData = RBD[,train.cols],
 #               ref =  "NBM",
 #               GOI=NULL)
 
-dim(DE$Voom$E)
+dim(DE$Voom$E) #31406   849
 dim(DE$DE) #1346    6
 # table(rownames(DE$Voom$E) %in% lncRNAs$gene_id)
 ```
 
 ```{r}
-# dim(DE.all$DE) #6,664
-# sum(rownames(all_DE_lncRNAs) %in% rownames(DE.all$DE))
-# write.csv(DE.all$DE %>% 
-#             rownames_to_column("gene_id") %>% 
-#             left_join(., IDmap, by="gene_id") %>%
-#             select(gene_id,gene_name,everything()),
-#   "Survival/TraingSet_AMLvsNBM_DE_lncRNA_mRNAs.csv" )
-# head(all_DE_lncRNAs)
-
 DE$DE <- DE$DE %>% 
   rownames_to_column("gene_id") %>% 
   right_join(., lncRNAs, by="gene_id") %>% 
@@ -875,14 +550,18 @@ DE$DE <- DE$DE %>%
 
 
 head(DE$DE)
+dim(DE$DE) #1346    9
 # sum(DE$DE$adj.P.Val < 0.05)
 # sum(abs(DE$DE$logFC) > 1.0)
 # write.csv(DE$DE,"Survival/TraingSet_AMLvsNBM_DEGs.csv", row.names = FALSE)
 ```
 
 ```{r}
-DE <- list()
-DE$DE <- read.csv("Survival/TraingSet_AMLvsNBM_DEGs.csv")
+if(!exists("DE")){
+  DE <- list()
+  DE$DE <- read.csv("Survival/TraingSet_AMLvsNBM_DEGs.csv")
+}
+
 table(DE$DE$logFC > 1) #647 upreg
 ```
 
@@ -911,54 +590,20 @@ dim(CPM.lnc)
 ```
 
 ```{r}
-df <- CPM.lnc %>% 
-  as.data.frame() %>%
-  rownames_to_column("gene") %>% 
-  mutate(lncRNA=ifelse(gene %in% lncRNAs$gene_id,
-                       "yes","no")) %>% 
-  gather(sample,log2_CPM,-gene,-lncRNA) %>%
-  mutate(Group=ifelse(grepl("BM[0-9]|RO[0-9]", sample), "NBM","AML"))
-
-# head(df)
-dens.plot <- ggplot(data = df, aes(log2_CPM, fill=lncRNA)) +
-  geom_density() +
-  facet_wrap(~Group) +
-  labs(title = "Distribution of lncRNAs in Pediatric AML")
-  
-dens.plot
-# ggsave(filename = "TARGET_AML_lncRNAs_Distribution.svg", plot = dens.plot, device = "pdf",height = 5, width = 7)
-```
-
-```{r}
-#for compatibility keep all gene in RBD in polyA dataset
-polyA.lnc <- polyA[keep,] 
-TMM.norm2 <- calcNormFactors(polyA.lnc, method = 'TMM')
-lib.size2 <- colSums(polyA.lnc)
-
-polyA.CPM.lnc <- cpm(polyA.lnc, 
-               lib.size = lib.size2*TMM.norm2,
-               log=TRUE, 
-               prior.count = 0.5)
-
-dim(polyA.CPM.lnc) #26157   315
-```
-
-```{r}
 Targets <- DE$DE %>% 
   mutate(Comparison="AMLvsNBM") %>%
   filter(grepl("^ENSG", gene_id)) %>% #remove Transposable elements
   filter(gene_id %in% rownames(CPM.lnc))
   
 
-dim(Targets) #1588   34
-length(unique(Targets$gene_id)) #1452 (1431??)
+# dim(Targets) #898 lncRNAs
+# length(unique(Targets$gene_id))  #898
 head(Targets[,1:5])
 ```
 
 ```{r}
-targets <- unique(targets$gene_id)
+targets <- unique(Targets$gene_id)
 targets <- setdiff(targets, colnames(CDE.train)) 
-#targets <- c(targets, "ENSG00000248489","ENSG00000281903") #include adult lncRNAs for just a curiosity question
 
 CDE.train <- CDE.train %>%
   #merge in the log2 TMM CPM normalized expression 
@@ -999,18 +644,6 @@ CDE.validation <- CDE.validation %>%
 dim(CDE.validation)
 ```
 
-```{r}
-CDE.validation2 <- CDE.validation2 %>% 
-    left_join(.,polyA.CPM.lnc[targets,] %>%
-              t() %>%
-              as.data.frame() %>% 
-              rownames_to_column("USI"), 
-            by="USI") 
-
-dim(CDE.validation2)
-```
-
-
 # Univariate survival Coxph regressions
 
 ```{r}
@@ -1020,24 +653,23 @@ ures <- lapply(Genes, cox_reg, CDE=CDE.train) %>%
   bind_rows() %>% 
   dplyr::rename(P.Value="P-value",Hazard.Ratio="Hazard Ratio") %>% 
   mutate(Adj.P.value=p.adjust(P.Value, method = "BH")) %>%
-  left_join(., select(DEGs.DF,gene_id,gene_name,
+  left_join(., 
+            select(Targets, gene_id,gene_name,
                       gene_type,matches("Comparison"),logFC,
                       FC.BH.PVal=adj.P.Val),
             by=c("Variable"="gene_id"))
-
 
 sig.ures <- ures %>% 
   mutate(Sig.05=P.Value < 0.05, 
          Sig.10=P.Value < 0.1)  %>%
   filter(Sig.05 == TRUE | Sig.10 == TRUE) %>%
   arrange(desc(Hazard.Ratio))
-
-dim(sig.ures) #446 univariate significantly associated 
+# 
+# dim(sig.ures) #278 univariate significantly associated 
 head(sig.ures)
 
-
-# filter(sig.ures, Sig.10==TRUE, logFC > 0, Comparison=="AMLvsNBM") %>% 
-#   dim()
+filter(sig.ures, Sig.10==TRUE, logFC > 0, Comparison=="AMLvsNBM") %>%
+  dim() #142
 ```
 
 
@@ -1052,14 +684,13 @@ uv_upreg_0.1 <- cox_glmnet_workflow(CDE.train = CDE.train,
                               IDmap = lncRNAs, 
                               N.Groups = 4,
                               oneSE=FALSE,
-                              sig.mres = filter(sig.mres,Comparison=="AMLvsNBM"),
                               CDE.test = CDE.test,
                               CDE.validation = CDE.validation,
-                              CDE.validation2 = CDE.validation2)
+                              CDE.validation2 = NULL)
 
 dim(uv_upreg_0.1$nonZero.train.coef) #37 gene model
-extract_metrics_df(uv_upreg_0.1$error.metrics,V=TRUE,V2=TRUE)
-uv_upreg_0.1$AIC
+extract_metrics_df(uv_upreg_0.1$error.metrics,V=TRUE,V2=FALSE)
+# uv_upreg_0.1$AIC
 # uv_upreg_0.1 <- readRDS("Survival/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_12.11.20.RDS")
 ```
 
@@ -1071,7 +702,40 @@ gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.EFS.Med[1:3],
 gridExtra::grid.arrange(grobs=c(uv_upreg_0.1$error.metrics$KM.OS.Med[1:3],
                                 uv_upreg_0.1$error.metrics$KM.OS.Perc[1:3]), ncol=3, nrow=2) #%>% 
     # ggsave(filename = "lncRNA_Score_OS_KM_TrTeVal.svg", device = "pdf", units = "in", dpi=300, height = 7, width = 9)
+```
 
+```{r}
+pdf("Survival/Retrain/uv_upreg_0.1_rerun_09.27.2022.pdf", height=10, width=15)
+plot(uv_upreg_0.1$cv.lambda)
+dev.off()
+
+# saveRDS(uv_upreg_0.1, "Survival/Retrain/Original_TMM_1300samples_uv_upreg_0.1.RDS")
+```
+
+```{r}
+retrain <- readRDS("Survival/Retrain/retrained.RDS")
+```
+
+```{r}
+# pdf("Survival/Retrain/uv_upreg_0.1_retrain_cv_lambda.pdf", height=10, width=15)
+# plot(retrain$cv.lambda)
+# dev.off()
+```
+
+
+```{r}
+old_mod <- readRDS("Survival/00_Archive/TARGET_AML_RBD_lncRNAs_UV_upreg_pvalue_LT0.1_7.15.19.RDS")
+
+```
+
+```{r}
+# pdf("Survival/uv_upreg_0.1_originalObject_cv_lambda.pdf", height=10, width=15)
+# plot(old_mod$cv.lambda)
+# dev.off()
+```
+
+```{r}
+plot(old_mod$cv.lambda)
 ```
 
 ```{r}
@@ -1490,9 +1154,10 @@ summary(LSC.lnc.asIs$EFS.cox[[1]])
 ```
 
 
+
 ```{r}
 LSC.lnc.Low <- KM.plots(df=filter(final.mod$Model.Comparison.df,lnc.Med.Groups_AllPts == "low") %>% 
-                                mutate(LSC17.win.LncLow=quantcut(LSC17.Score,q=2,na.rm=FALSE, 
+                                mutate(LSC17.win.LncLow=gtools::quantcut(LSC17.Score,q=2,na.rm=FALSE, 
                                                                  labels=c("low","high"))), 
                          group_vars = NULL,
                          covariate = "LSC17.win.LncLow",
@@ -1504,7 +1169,7 @@ grid.arrange(grobs=c(LSC.lnc.Low$OS, LSC.lnc.Low$EFS), ncol=2)
 
 ```{r fig.height=10, fig.width=10}
 LSC.lnc.Hi <- KM.plots(df=filter(final.mod$Model.Comparison.df,lnc.Med.Groups_AllPts == "high") %>% 
-                                mutate(LSC17.win.LncHi=quantcut(LSC17.Score,q=2,na.rm=FALSE, 
+                                mutate(LSC17.win.LncHi=gtools::quantcut(LSC17.Score,q=2,na.rm=FALSE, 
                                                                  labels=c("low","high"))), 
                          group_vars = NULL,
                          covariate = "LSC17.win.LncHi",
